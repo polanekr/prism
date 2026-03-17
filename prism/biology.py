@@ -40,7 +40,7 @@ class BaseBioModel:
             dose_distribution: 1D numpy array (Gy), doses of voxels in the volume.
             outcome: Measured biological response (e.g., colony count, survivors).
             covariates: Additional data (e.g., n_seeded, days, etc.)
-        """Log-Likelihood Mentése
+        """
         # Downsampling if too many voxels (for PyMC speed)
         # 10,000 voxels are sufficient for statistics.
         if len(dose_distribution) > 10000:

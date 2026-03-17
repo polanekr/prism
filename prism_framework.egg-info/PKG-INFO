@@ -1,0 +1,64 @@
+Metadata-Version: 2.4
+Name: prism-framework
+Version: 0.1.0
+Summary: Probabilistic 3D dose reconstruction framework
+Author-email: Sajat Nev <email@example.com>
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE.txt
+Dynamic: license-file
+
+# PRISM: Probabilistic Reconstruction of Inhomogeneous Systems Methodology
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+
+**PRISM** is a Bayesian framework designed to bridge the gap between physical dosimetry and radiobiological response in complex, spatially inhomogeneous radiation fields (e.g., Laser-Driven Ion Acceleration, FLASH radiotherapy, Grid therapy).
+
+Unlike traditional methods that assume a uniform dose, PRISM reconstructs the full 3D dose distribution from sparse measurements and propagates dosimetric uncertainties into biological models using an *Error-in-Variables* approach.
+
+## Key Features
+
+* **☢️ Precision Dosimetry:** Gafchromic film processing with multi-channel correction and artifact cleaning (bFDR).
+* **🎲 Bayesian Reconstruction:** 3D volume reconstruction from sparse 2D films using Gaussian Processes.
+* **🧬 Biological Modeling:** * **Cell Survival:** Linear-Quadratic (LQ) model with dose uncertainty correction.
+    * **In-Vivo (Zebrafish):** Voxel-integrated Weibull survival models for complex organisms.
+* **📊 Statistical Rigor:** RBE calculation, LOO model comparison, and Prior Sensitivity Analysis.
+
+## Installation
+
+```bash
+git clone [https://github.com/yourusername/PRISM-Framework.git](https://github.com/yourusername/PRISM-Framework.git)
+cd PRISM-Framework
+pip install -r requirements.txt
+
+**Quick Start**
+
+Here is a minimal example of how to reconstruct a 3D dose volume:
+
+from prism.reconstruction import Bayesian3DVolumeReconstructor
+
+# 1. Initialize Reconstructor
+recon = Bayesian3DVolumeReconstructor(pdd_folder="data/processed")
+
+# 2. Build 3D Volume from 2D films
+recon.build_volume(roi_size_mm=40.0, z_res_mm=0.2)
+
+# 3. Save result
+recon.save_volume("results/volume.npz")
+
+**Documentation**
+
+For detailed step-by-step instructions, please refer to the User Manual:
+
+**Citation**
+
+    Polanek Róbert et al. (2024). PRISM: A Bayesian framework... [Journal]
+
+License
+
+MIT License

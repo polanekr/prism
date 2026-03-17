@@ -117,43 +117,41 @@ class Bayesian3DVolumeReconstructor:
 
     def _create_and_run_fitter(self, beam_type: str = 'photon'):
         """
-        Creates and runs the Bayesian PDD fitter to estimate the depth-dose trend.
+        Creates and runs the Bayesian PDD fitter.
+        Uses the exact logic from the original dose_reconstruction.py.
         """
         print("\n--- Fitting Physical Model (Bayesian Fitter) ---")
         z_meas = []
         dose_meas = []
         
-        # Extract central ROI average for fitting
+        # Central ROI (2 mm radius)
         roi_px = int(2.0 / self.pix_mm)
         
         for z in sorted(self.pdd_data.keys()):
             img = self.pdd_data[z]
             h, w = img.shape
             cy, cx = h//2, w//2
+            
             y1, y2 = max(0, cy-roi_px), min(h, cy+roi_px)
             x1, x2 = max(0, cx-roi_px), min(w, cx+roi_px)
             
             roi = img[y1:y2, x1:x2]
             if roi.size > 0:
-                dose_val = np.mean(roi)
+                dose_val = np.mean(roi) 
                 z_meas.append(z)
                 dose_meas.append(dose_val)
         
         # Instantiate Fitter
-        try:
-            self.fitter = FullPDDBayesianFitter.create_from_physical_params(
-                z_meas, 
-                dose_meas, 
-                E0_MeV=self.energy, 
-                E0_std_MeV=self.energy_std,
-                SSD_mm=self.ssd,
-                mode_override=beam_type
-            )
-            self.fitter.build_model()
-            self.fitter.run_fit()
-        except NameError:
-             print("  -> Fitter module not available, skipping advanced physics fit.")
-             
+        self.fitter = FullPDDBayesianFitter.create_from_physical_params(
+            z_meas, 
+            dose_meas, 
+            E0_MeV=self.energy, 
+            E0_std_MeV=self.energy_std,
+            SSD_mm=self.ssd,
+            mode_override=beam_type
+        )
+        self.fitter.build_model()
+        self.fitter.run_fit()
         return self.fitter
 
     def build_volume(self, roi_size_mm: float = 40.0, z_res_mm: float = 0.2, 
@@ -161,52 +159,39 @@ class Bayesian3DVolumeReconstructor:
                      shape_threshold_ratio: float = 0.15,
                      perform_alignment: bool = True, align_crop_mm: float = 15.0):
         """
-        STEP 1: Reconstruct the full 3D Dose Volume from sparse measurements.
-        
-        Args:
-            roi_size_mm (float): Size of the Region of Interest to reconstruct.
-            z_res_mm (float): Z-axis resolution (slice thickness).
-            beam_type (str): 'photon' or 'electron'.
-            divergence_correction (bool): Correct for beam divergence (1/r^2).
-            shape_threshold_ratio (float): Noise threshold relative to max dose.
-            perform_alignment (bool): Align layers based on Center of Mass.
-            align_crop_mm (float): Crop edges before alignment to avoid markers/text.
+        STEP 1: Reconstruct the full 3D Dose Volume.
+        Restored to the exact mathematical logic of the original dose_reconstruction.py.
         """
+        from scipy.ndimage import center_of_mass, shift, zoom
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+        
         corr_status = "ON" if divergence_correction else "OFF"
         align_status = f"ON (Crop={align_crop_mm}mm)" if perform_alignment else "OFF"
         
         print(f"\n--- 1. Building 3D Volume (DivCorr: {corr_status}, Align: {align_status}) ---")
         
         self.volume = None
-        if self.fitter is None and 'FullPDDBayesianFitter' in globals():
-             self._create_and_run_fitter(beam_type=beam_type)
+        if self.fitter is None: 
+            self._create_and_run_fitter(beam_type=beam_type)
 
-        # 1. PDD Trend Estimation
+        # 1. PDD Trend & Anchoring (Original logic!)
         max_depth = max(self.pdd_data.keys()) + 5.0
         z_axis = np.arange(0, max_depth, z_res_mm)
+        pdd_trend_mean, _ = self.fitter.predict(z_axis)
         
-        if self.fitter:
-            pdd_trend_mean, _ = self.fitter.predict(z_axis)
-        else:
-             # Fallback if fitter is missing: simple interpolation
-             keys = sorted(self.pdd_data.keys())
-             vals = [np.mean(self.pdd_data[k]) for k in keys]
-             pdd_trend_mean = np.interp(z_axis, keys, vals)
-
-        # Anchoring to measured data (at approx 16mm depth or similar)
-        anchor_depth = 16.0
+        # Anchoring to measured D_max using robust 99th percentile
         keys = sorted(self.pdd_data.keys())
         meas_vals = [np.percentile(self.pdd_data[k], 99) for k in keys]
-        dose_meas_anchor = np.interp(anchor_depth, keys, meas_vals)
+        best_idx = np.argmax(meas_vals)
+        anchor_depth = keys[best_idx]
+        
+        dose_meas_anchor = meas_vals[best_idx]
         dose_fit_anchor = np.interp(anchor_depth, z_axis, pdd_trend_mean)
         
-        # Avoid division by zero
-        if dose_fit_anchor > 0:
-            pdd_trend = pdd_trend_mean * (dose_meas_anchor / dose_fit_anchor)
-        else:
-            pdd_trend = pdd_trend_mean
+        pdd_trend = pdd_trend_mean * (dose_meas_anchor / dose_fit_anchor)
 
-        # 2. Learning Profile Shape (Gaussian Process)
+        # 2. Learning Profile Shape
         stack_list = []
         train_z = []
         
@@ -221,12 +206,12 @@ class Bayesian3DVolumeReconstructor:
         
         for z in keys:
             img = self.pdd_data[z]
-            local_max_robust = np.percentile(img, 99)
+            local_max_robust = np.percentile(img, 99) # Original robust logic!
             
             if local_max_robust < noise_threshold: continue
             last_valid_z = z 
 
-            # Divergence Correction (scaling)
+            # Divergence Correction
             if divergence_correction:
                 mag_factor = (self.ssd + z) / self.ssd
                 try: img_normalized = zoom(img, 1.0/mag_factor, order=1)
@@ -236,22 +221,18 @@ class Bayesian3DVolumeReconstructor:
 
             h, w = img_normalized.shape
             
-            # --- ALIGNMENT LOGIC ---
+            # --- ALIGNMENT ---
             shift_y, shift_x = 0, 0
-            
             if perform_alignment:
                 img_for_calc = img_normalized.copy()
-                
-                # CROP EDGES (Remove markers)
                 if align_crop_mm > 0:
                     cut_px = int(align_crop_mm / self.pix_mm)
                     if 2*cut_px < h and 2*cut_px < w:
-                        img_for_calc[:cut_px, :] = 0  # Top
-                        img_for_calc[-cut_px:, :] = 0 # Bottom
-                        img_for_calc[:, :cut_px] = 0  # Left
-                        img_for_calc[:, -cut_px:] = 0 # Right
+                        img_for_calc[:cut_px, :] = 0  
+                        img_for_calc[-cut_px:, :] = 0 
+                        img_for_calc[:, :cut_px] = 0  
+                        img_for_calc[:, -cut_px:] = 0 
                 
-                # Thresholding
                 thresh_val = local_max_robust * 0.5 
                 thresh_img = np.where(img_for_calc > thresh_val, img_for_calc, 0)
                 
@@ -260,23 +241,20 @@ class Bayesian3DVolumeReconstructor:
                 else:
                     cy, cx = center_of_mass(thresh_img)
                 
-                # Calculate shift
                 target_y, target_x = h // 2, w // 2
                 shift_y, shift_x = target_y - cy, target_x - cx
             
-            # Apply Shift
             if shift_y != 0 or shift_x != 0:
                 img_aligned = shift(img_normalized, shift=[shift_y, shift_x], order=1)
             else:
                 img_aligned = img_normalized
             
             # Extract ROI
-            target_y, target_x = h // 2, w // 2
+            target_y, target_x = h // 2, w // 2 
             y_start = max(0, target_y-roi_px); y_end = min(h, target_y+roi_px)
             x_start = max(0, target_x-roi_px); x_end = min(w, target_x+roi_px)
             crop = img_aligned[y_start:y_end, x_start:x_end]
             
-            # Padding if crop is smaller than target
             if crop.shape != target_shape:
                 pad_crop = np.zeros(target_shape)
                 dy, dx = crop.shape
@@ -288,8 +266,8 @@ class Bayesian3DVolumeReconstructor:
                 stack_list.append(crop / local_max_robust)
                 train_z.append(z)
 
-        # GP Fit
-        if not stack_list: raise ValueError("Error: No films found with sufficient signal!")
+        # GP Fit on Shapes
+        if not stack_list: raise ValueError("Error: No valid films found!")
         
         print(f"  -> Learning shape from {len(stack_list)} layers.")
         stack_array = np.array(stack_list)
@@ -299,7 +277,6 @@ class Bayesian3DVolumeReconstructor:
         gp = GaussianProcessRegressor(kernel=kernel, normalize_y=False, alpha=1e-2)
         gp.fit(np.array(train_z).reshape(-1, 1), stack_array.reshape(n_samples, -1))
         
-        # Prediction (Shape Freezing after valid range)
         z_valid_mask = z_axis <= (last_valid_z + 2.0)
         z_valid = z_axis[z_valid_mask]
         
@@ -325,7 +302,6 @@ class Bayesian3DVolumeReconstructor:
             else:
                 slice_zoomed = current_shape
             
-            # Final cropping/padding to fixed size
             zh, zw = slice_zoomed.shape
             slice_fixed = np.zeros((target_h, target_w))
             
@@ -340,7 +316,6 @@ class Bayesian3DVolumeReconstructor:
 
         self.volume = np.array(final_volume) * pdd_trend.reshape(-1, 1, 1)
         
-        # Cleanup noise
         cleanup_thresh = np.max(self.volume) * 0.005
         self.volume[self.volume < cleanup_thresh] = 0.0
         self.uncertainty = self.volume * 0.05 
@@ -354,7 +329,7 @@ class Bayesian3DVolumeReconstructor:
         self._volume_backup = self.volume.copy()
         self._uncertainty_backup = self.uncertainty.copy()
         self.is_built = True
-        print("  -> 3D Volume Construction Complete (Backup created).")
+        print("  -> 3D Volume Construction Complete.")
         
     def create_backup_from_current_state(self):
         """Creates a manual backup point from the current volume state."""
@@ -394,12 +369,7 @@ class Bayesian3DVolumeReconstructor:
                            roi_size_mm: float = 10.0, crop_edges_mm: float = 8.0):
         """
         STEP 2: Align and Scale the Volume to the Front Film.
-        
-        Args:
-            front_film_map: 2D dose map of the front film.
-            front_film_depth_mm: Physical depth of the film.
-            roi_size_mm: Size of the central ROI for scaling factor calculation.
-            crop_edges_mm: Margin to crop from film edges to avoid marker artifacts during alignment.
+        (JAVÍTOTT VERZIÓ: Relatív középpont-számítással és független indexeléssel)
         """
         if not self.is_built: raise RuntimeError("Run build_volume first!")
         print(f"\n--- 2. Registration & Scaling (Front Film: {front_film_depth_mm}mm) ---")
@@ -407,28 +377,41 @@ class Bayesian3DVolumeReconstructor:
         z_idx = np.argmin(np.abs(self.coords['z'] - front_film_depth_mm))
         vol_slice = self.volume[z_idx, :, :]
         
+        # Geometriai középpontok kinyerése (Külön a filmre és külön a térfogatra!)
+        h_f, w_f = front_film_map.shape
+        h_v, w_v = vol_slice.shape
+        
+        center_f = (h_f // 2, w_f // 2)
+        center_v = (h_v // 2, w_v // 2)
+        
         # --- A) SMART SHIFT (Center of Mass Alignment) ---
         print(f"  -> Finding Center of Mass (Edge Crop: {crop_edges_mm} mm)...")
         
         margin_px = int(crop_edges_mm / self.pix_mm)
-        h, w = front_film_map.shape
         
-        # Crop film to remove markers
-        if margin_px < h//2 and margin_px < w//2:
+        # Film tömegközéppontja
+        if margin_px < center_f[0] and margin_px < center_f[1]:
             film_crop = front_film_map[margin_px:-margin_px, margin_px:-margin_px]
             com_crop = center_of_mass(film_crop)
             com_film = (com_crop[0] + margin_px, com_crop[1] + margin_px)
         else:
-            print("  ERROR: Crop margin too large! Using full image.")
             com_film = center_of_mass(front_film_map)
 
+        # Térfogat tömegközéppontja
         if np.sum(vol_slice) == 0:
             vol_slice = self.volume[np.argmax(np.sum(self.volume, axis=(1,2))), :, :]
-        
         com_vol = center_of_mass(vol_slice)
         
-        shift_y = com_film[0] - com_vol[0]
-        shift_x = com_film[1] - com_vol[1]
+        # JAVÍTÁS: A relatív offszetet számoljuk a SAJÁT középpontjukhoz képest!
+        offset_film_y = com_film[0] - center_f[0]
+        offset_film_x = com_film[1] - center_f[1]
+        
+        offset_vol_y = com_vol[0] - center_v[0]
+        offset_vol_x = com_vol[1] - center_v[1]
+        
+        # A valós, fizikai eltolás a két offszet különbsége
+        shift_y = offset_film_y - offset_vol_y
+        shift_x = offset_film_x - offset_vol_x
         
         print(f"  -> Detected Shift: Y={shift_y*self.pix_mm:.1f}mm, X={shift_x*self.pix_mm:.1f}mm")
         
@@ -437,23 +420,23 @@ class Bayesian3DVolumeReconstructor:
                 self.volume[z] = shift(self.volume[z], shift=[shift_y, shift_x], order=1, cval=0.0)
             print("  -> Volume shifted to match film center.")
             self.is_aligned = True
+            vol_slice_shifted = self.volume[z_idx, :, :] # Frissítjük a skálázáshoz
         else:
             print("  -> No shift needed.")
+            vol_slice_shifted = vol_slice
 
         # --- B) SCALING (Central ROI) ---
-        vol_slice_shifted = self.volume[z_idx, :, :]
-        cy, cx = h // 2, w // 2 
-        
         r_px = int((roi_size_mm / 2.0) / self.pix_mm)
         if r_px < 1: r_px = 1
         
-        roi_film = front_film_map[cy-r_px : cy+r_px, cx-r_px : cx+r_px]
-        roi_vol  = vol_slice_shifted[cy-r_px : cy+r_px, cx-r_px : cx+r_px]
+        # JAVÍTÁS: Független ROI kivágás a saját középpontjuk körül!
+        roi_film = front_film_map[center_f[0]-r_px : center_f[0]+r_px, center_f[1]-r_px : center_f[1]+r_px]
+        roi_vol  = vol_slice_shifted[center_v[0]-r_px : center_v[0]+r_px, center_v[1]-r_px : center_v[1]+r_px]
         
         val_film = np.mean(roi_film)
         val_vol = np.mean(roi_vol)
         
-        if val_vol == 0:
+        if val_vol < 1e-3:
             val_vol = 1.0
             print("  ERROR: Model ROI is empty! (Alignment failed?)")
 
@@ -608,7 +591,8 @@ class Bayesian3DVolumeReconstructor:
                            mask_contours=contour_data)
         
         plt.tight_layout()
-        plt.savefig(f"DEBUG_{roi_name}_alignment.png")
+        plt.show()
+        #plt.savefig(f"DEBUG_{roi_name}_alignment.png")
         print(f"  -> Debug image saved: DEBUG_{roi_name}_alignment.png")
         plt.close(fig)
 
@@ -686,6 +670,61 @@ class Bayesian3DVolumeReconstructor:
                 'embryo_smoothing_mm': embryo_diameter_mm
             }
         }
+    
+    def get_spatial_dose_map(self, mask_name: str):
+        """
+        Returns the full 3D dose matrix, the 3D boolean mask, and the coordinate axes.
+        This is required for voxel-level biological calculations and spatial visualization.
+        """
+        if mask_name not in self.roi_masks:
+            raise ValueError(f"Mask not found: {mask_name}")
+            
+        return {
+            'dose_3d': self.volume.copy(),
+            'mask_3d': self.roi_masks[mask_name].copy(),
+            'coords': self.coords
+        }
+    
+    def save_dvh_to_file(self, filepath: str, mask_name: str, calibration_k_factor: float = 1.0, 
+                         n_bins: int = 50, embryo_diameter_mm: float = 1.0):
+        """
+        Calculates and saves the differential DVH (dDVH) statistics for a specific 
+        ROI mask into an .npy file.
+        
+        The saved file contains a Python dictionary (as an Object Array) with the 
+        keys: 'dose_stats', 'weights', and 'meta'.
+        
+        Args:
+            filepath (str): Output filename or path (the .npy extension is added automatically).
+            mask_name (str): Name of the target ROI mask (e.g., 'Left' or 'Eppendorf').
+            calibration_k_factor (float): Optional scaling factor for the absolute dose.
+            n_bins (int): Resolution of the histogram (number of bins).
+            embryo_diameter_mm (float): Smoothing kernel size to simulate physical target size.
+        """
+        import os
+        import numpy as np
+        
+        if mask_name not in self.roi_masks:
+            print(f"  ERROR: Mask '{mask_name}' does not exist!")
+            return
+            
+        # Biztosítjuk a .npy kiterjesztést
+        if not filepath.endswith('.npy'):
+            filepath += '.npy'
+            
+        print(f"\n--- Exporting dDVH dictionary to NPY: {filepath} (Mask: {mask_name}) ---")
+        
+        try:
+            # 1. Kinyerjük a teljes szótárat (dictionary) a meglévő metódusunkkal
+            stats_dict = self.get_dvh_statistics(mask_name, calibration_k_factor, n_bins, embryo_diameter_mm)
+            
+            # 2. Elmentjük a szótárat közvetlenül. A NumPy automatikusan Object Array-t csinál belőle.
+            np.save(filepath, stats_dict)
+            
+            print(f"  -> Save successful! File size: {os.path.getsize(filepath)} bytes.")
+            
+        except Exception as e:
+            print(f"  ERROR: Failed to save the NPY file: {e}")
         
     def get_equivalent_uniform_dose(self, mask_name: str, a_parameter: float = 1.0):
         """
@@ -711,6 +750,93 @@ class Bayesian3DVolumeReconstructor:
             
         print(f"[{mask_name}] EUD (a={a_parameter}): {eud:.2f} Gy")
         return eud
+    
+    def plot_central_pdd(self, roi_size_mm=2.0, normalize=True):
+        """
+        Kivág egy központi hengert a már rekonstruált, nagyfelbontású 3D térfogatból,
+        és kirajzolja a nyers filmekből mért pontokkal együtt.
+        """
+        if not self.is_built or self.volume is None:
+            print("  [!] A 3D térfogat még nincs felépítve! Futtasd le a build_volume() metódust.")
+            return
+
+        print("\n--- Ábra generálása: PDD a rekonstruált 3D térből ---")
+        
+        # 1. Középponti ROI kiszámítása pixelben (sugarú henger)
+        roi_px = max(1, int((roi_size_mm / 2.0) / self.pix_mm))
+        
+        # =====================================================================
+        # 2. MÉRT PONTOK (PIROS PÖTTYÖK) KINYERÉSE A FILMEKBŐL
+        # =====================================================================
+        z_meas = sorted(self.pdd_data.keys())
+        dose_meas = []
+        
+        for z in z_meas:
+            img = self.pdd_data[z]
+            h, w = img.shape
+            cy, cx = h // 2, w // 2
+            
+            y1, y2 = max(0, cy - roi_px), min(h, cy + roi_px)
+            x1, x2 = max(0, cx - roi_px), min(w, cx + roi_px)
+            
+            roi = img[y1:y2, x1:x2]
+            dose_meas.append(np.mean(roi))
+            
+        z_meas = np.array(z_meas)
+        dose_meas = np.array(dose_meas)
+
+        # =====================================================================
+        # 3. A 0.2mm-ES REKONSTRUÁLT 3D TÉR KÖZÉPVONALÁNAK KIVÁGÁSA
+        # =====================================================================
+        z_vol = self.coords['z']
+        
+        # Használjuk a _volume_backup-ot, ha van, hogy a regisztráció/skálázás ne torzítsa
+        vol_to_use = self._volume_backup if self._volume_backup is not None else self.volume
+        ny, nx = vol_to_use.shape[1:]
+        
+        y1_v, y2_v = max(0, ny // 2 - roi_px), min(ny, ny // 2 + roi_px)
+        x1_v, x2_v = max(0, nx // 2 - roi_px), min(nx, nx // 2 + roi_px)
+        
+        # Átlagolás a 3D mátrix közepén lévő 2mm-es oszlopban végig a Z tengelyen
+        vol_pdd = np.mean(vol_to_use[:, y1_v:y2_v, x1_v:x2_v], axis=(1, 2))
+
+        # =====================================================================
+        # 4. NORMALIZÁLÁS ÉS RAJZOLÁS
+        # =====================================================================
+        norm_factor = 1.0
+        ylabel = "Absolute Dose [Gy]"
+        
+        if normalize:
+            max_dose = np.max(dose_meas) 
+            norm_factor = 100.0 / max_dose
+            ylabel = "Relative Dose [%]"
+
+        plt.figure(figsize=(10, 6))
+        
+        # A rekonstruált nagyfelbontású 3D térfogat görbéje
+        plt.plot(z_vol, vol_pdd * norm_factor, 'b-', lw=2.5, label='Reconstructed 3D Volume (Central Axis)')
+        
+        # Bizonytalansági sáv (ha létezik)
+        unc_to_use = self._uncertainty_backup if self._uncertainty_backup is not None else self.uncertainty
+        if unc_to_use is not None:
+            unc_pdd = np.mean(unc_to_use[:, y1_v:y2_v, x1_v:x2_v], axis=(1, 2))
+            plt.fill_between(z_vol, 
+                             (vol_pdd - unc_pdd) * norm_factor, 
+                             (vol_pdd + unc_pdd) * norm_factor, 
+                             color='dodgerblue', alpha=0.3, label='Model Uncertainty (±1 SD)')
+
+        # A filmekből mért pontok
+        plt.plot(z_meas, dose_meas * norm_factor, 'ro', markersize=8, markeredgecolor='black', 
+                 zorder=5, label=f'Measured Film Data ({roi_size_mm}mm ROI)')
+        
+        plt.title("Central Axis Depth-Dose Curve (Reconstructed vs Measured)", fontsize=14, fontweight='bold')
+        plt.xlabel("Depth in Phantom Z [mm]", fontsize=12)
+        plt.ylabel(ylabel, fontsize=12)
+        plt.xlim(0, max(z_meas) + 5.0)
+        plt.grid(True, linestyle=':', alpha=0.7)
+        plt.legend(fontsize=11)
+        plt.tight_layout()
+        plt.show()
 
     # --- ROI MASK GENERATORS ---
 
@@ -769,9 +895,9 @@ class Bayesian3DVolumeReconstructor:
         vol_mm3 = vox_count * (self.pix_mm**2) * (Z[1]-Z[0])
         print(f"  -> Created: {vol_mm3:.1f} mm3")
         
-    def add_eppendorf_mask(self, name, volume_ml=1.5, tip_position=(0,0,15), angle_from_x_deg=0.0, filled_height_mm=None):
+    def add_eppendorf_mask(self, name, volume_ml=1.5, tip_position=(0,0,15), angle_from_x_deg=0.0, filled_height_mm=None, radius=5.4):
         """Creates an ROI mask for an Eppendorf tube (1.5ml or 2.0ml)."""
-        radius = 5.4  # ~10.8 mm diameter
+        #radius = 5.4 # ~10.8 mm diameter
         
         if abs(volume_ml - 1.5) < 0.1:
             tip_length = 17.5 
@@ -946,13 +1072,23 @@ class Bayesian3DVolumeReconstructor:
 ###############################################################################
 
 def plot_dvh_comparison(filenames, labels=None, cumulative=False):
-    """Compare multiple DVH files."""
+    """Compare multiple DVH files (.npy format containing dictionary)."""
     plt.figure(figsize=(10, 6))
     if labels is None: labels = [f"DVH {i+1}" for i in range(len(filenames))]
         
     for i, fname in enumerate(filenames):
-        data = np.load(fname, allow_pickle=True)
-        d, w = data['dose_bins'], data['weights']
+        if not os.path.exists(fname):
+            print(f"File not found: {fname}")
+            continue
+            
+        try:
+            # AZ ÚJ BEOLVASÁSI LOGIKA: .item() használata
+            data = np.load(fname, allow_pickle=True).item()
+            d = data['dose_stats'][0, :]  # A dózis értékek az első sorban vannak
+            w = data['weights']           # A térfogati súlyok
+        except Exception as e:
+            print(f"Error reading file {fname}: {e}")
+            continue
         
         if cumulative:
             idx = np.argsort(d)
@@ -980,9 +1116,10 @@ class DoseMetrics:
     def calculate_eud_from_file(file_path, a=-10.0):
         if not os.path.exists(file_path): return None
         try:
-            with np.load(file_path, allow_pickle=True) as data:
-                bins = np.nan_to_num(data['dose_bins'])
-                weights = np.nan_to_num(data['weights'])
+            # AZ ÚJ BEOLVASÁSI LOGIKA: .item() használata
+            data = np.load(file_path, allow_pickle=True).item()
+            bins = np.nan_to_num(data['dose_stats'][0, :])
+            weights = np.nan_to_num(data['weights'])
                 
             total_weight = np.sum(weights)
             if total_weight <= 0: return 0.0

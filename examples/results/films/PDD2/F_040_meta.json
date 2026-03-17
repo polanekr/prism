@@ -1,0 +1,9 @@
+{
+    "original_filename": "F_040.tif",
+    "pixel_spacing_mm": 0.254,
+    "max_dose": 27.87978764098239,
+    "unit": "Gy",
+    "method": "hybrid",
+    "cleaning_applied": true,
+    "depth_mm": 81.0
+}

@@ -1,0 +1,9 @@
+{
+    "original_filename": "scan_002.tif",
+    "pixel_spacing_mm": 0.254,
+    "max_dose": 8.098058341716776,
+    "unit": "Gy",
+    "method": "hybrid",
+    "cleaning_applied": true,
+    "depth_mm": 2.2
+}

@@ -1,0 +1,9 @@
+{
+    "original_filename": "FBX_040.tif",
+    "pixel_spacing_mm": 0.254,
+    "max_dose": 22.55492195698445,
+    "unit": "Gy",
+    "method": "hybrid",
+    "cleaning_applied": true,
+    "depth_mm": 2.2
+}

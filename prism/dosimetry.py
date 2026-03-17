@@ -64,6 +64,7 @@ class GafchromicEngine:
             os.makedirs(output_folder)
             
         self.calib_params = {} 
+        self.calib_traces = {}
         self.calib_doses = None
         self.calib_ods = None
         self.ratio_lut_func = None 
@@ -249,6 +250,7 @@ class GafchromicEngine:
                 pm.Normal('obs', mu=mu_od, sigma=sigma, observed=od_data)
                 
                 trace = pm.sample(draws=draws, chains=chains, target_accept=0.97, progressbar=False)
+                self.calib_traces[ch] = trace
                 
                 p_mean = az.summary(trace)['mean']
                 self.calib_params[ch] = np.array([p_mean['a'], p_mean['b'], p_mean['c'], 1.0])
@@ -446,21 +448,37 @@ class GafchromicEngine:
         print(f"Processing complete. Results saved to: {self.output_folder}")
 
     def _solver_fast(self, od_map: np.ndarray) -> np.ndarray:
-        """Fast vectorized solver."""
+        """Fast vectorized solver. (FIXED: Asymptote protection & Smart Blending)"""
         def inv(od, params):
             a, b, c = params[:3]
             e = params[3] if len(params)>3 else 1.0
-            num = c * (od - a)
-            den = (a + b) - od
+            
+            # VÉDELEM: Az OD nem lépheti túl az aszimptotát (a+b), különben a nevező negatív lesz!
+            # Egy nagyon pici 1e-4 értékkel alatta tartjuk, hogy a dózis magas legyen, de ne NaN.
+            max_valid_od = a + b - 1e-4
+            od_safe = np.clip(od, a, max_valid_od)
+            
+            num = c * (od_safe - a)
+            den = (a + b) - od_safe
+            
             with np.errstate(divide='ignore', invalid='ignore'):
                 ratio = num / den
                 ratio[ratio < 0] = 0
                 val = np.power(ratio, 1/e)
             return np.nan_to_num(val, nan=0.0)
             
-        dr = inv(np.clip(od_map[:,:,0], self.calib_params['R'][0], None), self.calib_params['R'])
-        dg = inv(np.clip(od_map[:,:,1], self.calib_params['G'][0], None), self.calib_params['G'])
-        return np.nan_to_num((dr + dg)/2, nan=0.0)
+        dr = inv(od_map[:,:,0], self.calib_params['R'])
+        dg = inv(od_map[:,:,1], self.calib_params['G'])
+        
+        # --- OKOS KEVERÉS (SMART BLENDING) ---
+        # A Piros csatorna 8 Gy felett megbízhatatlan. 
+        # Létrehozunk egy súlyt, ami 6 Gy-ig 1.0 (csak Piros), majd 10 Gy-nél lemegy 0.0-ra (csak Zöld).
+        weight_r = np.clip((10.0 - dr) / 4.0, 0.0, 1.0)
+        
+        # A végső dózis a súlyozott átlag
+        dose_map = weight_r * dr + (1.0 - weight_r) * dg
+        
+        return np.nan_to_num(dose_map, nan=0.0)
 
     def _solver_hybrid(self, od_map, fname_log=""):
         """
@@ -490,8 +508,14 @@ class GafchromicEngine:
             od_r = self.rational_func_od(D, *params_R) * t
             od_g = self.rational_func_od(D, *params_G) * t
             od_b = self.rational_func_od(D, *params_B) * t
+            
+            # Dinamikus súlyozás: Ha a dózis > 8 Gy, a Zöld csatorna vegye át az irányítást!
+            w_r = 1.0 if D < 8.0 else np.exp(-(D-8.0)/2.0)
+            w_g = 0.5 if D < 8.0 else 1.0
+            weights_dyn = np.array([w_r, w_g, 0.1])
+            
             diff = np.array([od_r, od_g, od_b]) - meas_rgb
-            return np.sum(weights * diff**2)
+            return np.sum(weights_dyn * diff**2)
 
         bnds = ((0, 60), (0.9, 1.1))
         opts = {'ftol': 1e-4, 'maxiter': 10, 'disp': False}
@@ -681,4 +705,5 @@ def compare_calibration_methods(engine, calib_folder, doses_gy, channel='red'):
     plt.ylabel("OD")
     plt.title(f"Calibration Method Comparison ({ch})")
     plt.legend()
+    plt.savefig('calibration.eps', dpi=300)
     plt.show()
