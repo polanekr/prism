@@ -14,12 +14,8 @@ __pycache__/
 venv/
 
 # Data (Soha ne tölts fel nyers mérési adatot a kód repositoryba, ha nagy!)
-*.tif
-*.tiff
-*.csv
-*.xls
-*.xlsx
-data/raw/*
+
+*.npz
 
 # IDE
 .vscode/

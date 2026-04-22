@@ -192,7 +192,7 @@ def plot_validation_figure(user_data):
     # --- PANEL C: FBX ---
     plot_violin_validation(axes[2], user_data['fbx'], "C. Volumetric Validation (FBX)", 'moccasin', 'darkorange')
 
-    filename = "fig_physical_validation_final.png"
+    filename = "fig9_physical_validation_final.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"\nKész! Ábra elmentve mint: {filename}")
     plt.show()

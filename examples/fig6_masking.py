@@ -46,7 +46,7 @@ def generate_alignment_figure(pdd_folder, film_path):
     # B PANEL: Nyers Dózistérkép (Gafchromic)
     ax1 = axes[0]
     im1 = ax1.imshow(film_map, cmap='turbo', extent=extent, origin='lower')
-    ax1.set_title("B. Raw Gafchromic Dose Map", fontsize=14, fontweight='bold')
+    ax1.set_title("A. Raw Gafchromic Dose Map", fontsize=14, fontweight='bold')
     ax1.set_xlabel("X Position [mm]", fontsize=12)
     ax1.set_ylabel("Y Position [mm]", fontsize=12)
     fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label="Dose [Gy]")
@@ -63,12 +63,12 @@ def generate_alignment_figure(pdd_folder, film_path):
                  textcoords='offset points', color='white', fontweight='bold', fontsize=11,
                  arrowprops=dict(facecolor='white', shrink=0.05, width=1.5, headwidth=6))
     
-    ax2.set_title("C. Spatial Registration & Virtual Mask", fontsize=14, fontweight='bold')
+    ax2.set_title("B. Spatial Registration & Virtual Mask", fontsize=14, fontweight='bold')
     ax2.set_xlabel("X Position [mm]", fontsize=12)
     ax2.set_ylabel("Y Position [mm]", fontsize=12)
     fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04, label="Dose [Gy]")
     
-    filename = "fig7_alignment_projection.png"
+    filename = "fig6_masking.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"Kész! Elmentve: {filename}")
     plt.show()

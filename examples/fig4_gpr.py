@@ -107,7 +107,7 @@ def generate_fig3_gpr_principle_v5():
     ax3.invert_zaxis()
     ax3.dist = 12 # Kamera hátrébb húzása
 
-    filename = "fig3_gpr_principle_v5.png"
+    filename = "fig4_gpr_principle.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"Kész! Ábra elmentve mint: {filename}")
     plt.show()

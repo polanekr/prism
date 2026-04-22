@@ -21,9 +21,9 @@ def generate_fig1_motivation():
     
     # Főcím
     ax.text(7.5, 8.5, "The Challenges of Advanced Pre-Clinical Dosimetry", 
-            ha='center', va='center', fontsize=18, fontweight='bold', color='#212121')
+            ha='center', va='center', fontsize=20, fontweight='bold', color='#212121')
     ax.text(7.5, 8.1, "Why standard mean-dose assumptions fail in radiobiology", 
-            ha='center', va='center', fontsize=14, fontstyle='italic', color='#616161')
+            ha='center', va='center', fontsize=18, fontstyle='italic', color='#616161')
 
     # ==========================================
     # SEÉGDFÜGGVÉNY A DOBOZOKHOZ
@@ -39,10 +39,10 @@ def generate_fig1_motivation():
         
         # Cím (vastaggal)
         ax.text(x+w/2, y+h-0.25, title, ha='center', va='top', 
-                fontsize=12, fontweight='bold', color=ec)
+                fontsize=16, fontweight='bold', color=ec)
         # Szöveg
         ax.text(x+w/2, y+h/2-0.1, text, ha='center', va='center', 
-                fontsize=11, linespacing=1.5, color='#212121')
+                fontsize=14, linespacing=1.5, color='#212121')
         
         # Visszaadjuk a doboz alsó közepének koordinátáit a nyilakhoz
         return (x+w/2, y)

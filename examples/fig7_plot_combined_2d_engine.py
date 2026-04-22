@@ -200,7 +200,7 @@ def generate_combined_2d_engine_figure(calib_folder: str, doses_gy: list, dose_f
     cbarD.set_label("Relative Predictive Uncertainty [%]", fontsize=12, fontweight='bold')
 
     # MENTÉS
-    filename = "fig4_combined_2D_engine.png"
+    filename = "fig7_combined_2D_engine.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"\nKész! Gyönyörű ábra elmentve: {filename}")
     plt.show()

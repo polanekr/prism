@@ -242,7 +242,7 @@ def generate_experimental_2x2_hybrid(npy_files: dict):
         ax_surv.set_xlim(-0.5, axis_x_limit)
         ax_surv.set_ylim(y_bottom, 1.5) 
 
-    filename = "fig8_experimental_2x2_hybrid_final.png"
+    filename = "fig11_FBX_simulation_radiobiology.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"\nKész! Ábra elmentve mint: {filename}")
     plt.show()

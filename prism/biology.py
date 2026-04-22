@@ -444,6 +444,221 @@ class CellSurvivalLQModel(BaseBioModel):
         plt.legend()
         plt.grid(True, which="both", alpha=0.3)
         plt.show()
+        
+        
+class CellSurvivalLQLModel(BaseBioModel):
+    """
+    Linear-Quadratic-Linear (LQL) Model for highly inhomogeneous fields.
+    
+    Prevents artificial over-penalization of high-dose "hot spots" by assuming 
+    the survival curve transitions to a purely linear exponential decay above 
+    a threshold dose (D_t).
+    
+    Equations:
+    D < D_t  : S = exp(-alpha*D - beta*D^2)
+    D >= D_t : S = exp(-alpha*D_t - beta*D_t^2 - gamma*(D - D_t))
+               where gamma = alpha + 2*beta*D_t (to ensure smooth derivative)
+    """
+    def __init__(self, cell_line="Generic", name="CellSurvival_LQL"):
+        super().__init__(name=f"{name}_{cell_line}")
+        self.cell_line = cell_line
+
+    def add_experiment_from_histogram(self, hist_data, colony_count, n_seeded, **kwargs):
+        """Same data ingestion as the LQ model."""
+        dose_stats = hist_data['dose_stats']
+        weights = hist_data['weights']
+        
+        data = {
+            'dose_bins': dose_stats[0, :],
+            'bin_stds':  dose_stats[1, :],
+            'weights':   weights,
+            'outcome':   int(colony_count),
+            'n_seeded':  int(n_seeded)
+        }
+        data.update(kwargs)
+        self.experiments.append(data)
+        
+        mean_dose = np.sum(data['dose_bins'] * weights)
+        print(f"[{self.name}] Sample added: {colony_count} colonies (Mean Dose: {mean_dose:.2f} Gy)")
+
+    def build_model(self):
+        if not self.experiments: return
+
+        dose_meas = np.vstack([e['dose_bins'] for e in self.experiments])
+        dose_std  = np.vstack([e['bin_stds'] for e in self.experiments])
+        weights   = np.vstack([e['weights'] for e in self.experiments])
+        outcomes  = np.array([e['outcome'] for e in self.experiments])
+        n_seededs = np.array([e['n_seeded'] for e in self.experiments]) 
+
+        print(f"[{self.name}] Building LQL model...")
+
+        with pm.Model() as self.model:
+            # --- 1. PARAMETERS ---
+            alpha = pm.TruncatedNormal('alpha', mu=0.2, sigma=0.15, lower=0.0)
+            beta = pm.TruncatedNormal('beta', mu=0.03, sigma=0.02, lower=0.0)
+            
+            # D_t: Threshold dose where the curve becomes linear (typically 8-12 Gy for most cells)
+            d_t = pm.TruncatedNormal('d_t', mu=10.0, sigma=2.0, lower=5.0, upper=20.0)
+            
+            pe = pm.Beta('pe', alpha=2, beta=2)
+            dispersion = pm.HalfNormal('dispersion', sigma=10.0)
+
+            # --- 2. ERROR-IN-VARIABLES ---
+            true_dose = pm.Normal('true_dose', mu=dose_meas, sigma=dose_std + 1e-3, shape=dose_meas.shape)
+            true_dose_clipped = pm.math.maximum(true_dose, 0.0)
+
+            # --- 3. LQL PIECEWISE INTEGRATION ---
+            # Part 1: Standard LQ up to D_t
+            log_s_lq = -alpha * true_dose_clipped - beta * (true_dose_clipped**2)
+            
+            # Part 2: Linear extension beyond D_t
+            # Calculate survival exactly at D_t
+            log_s_dt = -alpha * d_t - beta * (d_t**2)
+            # Calculate the slope (derivative) at D_t for a smooth transition
+            slope_dt = -alpha - 2 * beta * d_t
+            # Apply linear slope for the remaining dose (D - D_t)
+            log_s_lin = log_s_dt + slope_dt * (true_dose_clipped - d_t)
+            
+            # Switch between the two based on voxel dose
+            exponent = pm.math.switch(true_dose_clipped < d_t, log_s_lq, log_s_lin)
+            
+            exponent = pm.math.clip(exponent, -20, 0)
+            S_bins = pm.math.exp(exponent)
+            
+            S_weighted = pm.math.sum(S_bins * weights, axis=1)
+            
+            # --- 4. LIKELIHOOD ---
+            mu = n_seededs * pe * S_weighted
+            pm.NegativeBinomial('obs', mu=mu, alpha=dispersion, observed=outcomes)
+            
+            # Save log-likelihood for LOO comparison
+            pm.Deterministic('log_lik', pm.logp(pm.NegativeBinomial.dist(mu=mu, alpha=dispersion), outcomes))
+            
+    def plot_survival_curves(self, max_dose=12.0):
+        """Plots the piecewise LQL Survival Curve."""
+        if self.idata is None: return
+        
+        post = self.idata.posterior
+        alpha_s = post['alpha'].values.flatten()
+        beta_s = post['beta'].values.flatten()
+        dt_s = post['d_t'].values.flatten()
+        pe_s = post['pe'].values.flatten()
+        
+        d_axis = np.linspace(0, max_dose, 200)
+        
+        # Mátrixos számítás az LQL egyenletre
+        D_matrix = d_axis[None, :]
+        a_mat = alpha_s[:, None]
+        b_mat = beta_s[:, None]
+        dt_mat = dt_s[:, None]
+        
+        log_s_lq = -a_mat * D_matrix - b_mat * (D_matrix**2)
+        
+        log_s_dt = -a_mat * dt_mat - b_mat * (dt_mat**2)
+        slope_dt = -a_mat - 2 * b_mat * dt_mat
+        log_s_lin = log_s_dt + slope_dt * (D_matrix - dt_mat)
+        
+        exponent = np.where(D_matrix < dt_mat, log_s_lq, log_s_lin)
+        survivals = np.exp(exponent)
+        
+        mean_curve = np.mean(survivals, axis=0)
+        hpd_low = np.percentile(survivals, 2.5, axis=0)
+        hpd_high = np.percentile(survivals, 97.5, axis=0)
+        
+        plt.figure(figsize=(8, 6))
+        plt.fill_between(d_axis, hpd_low, hpd_high, color='darkred', alpha=0.2, label='95% Credible Interval (LQL)')
+        plt.plot(d_axis, mean_curve, color='darkred', lw=2, label='LQL Model Fit')
+        
+        mean_pe = np.mean(pe_s)
+        for i, exp in enumerate(self.experiments):
+            d_mean = np.sum(exp['dose_bins'] * exp['weights'])
+            sf_measured = exp['outcome'] / (exp['n_seeded'] * mean_pe)
+            y_err = (np.sqrt(exp['outcome']) / exp['outcome']) * sf_measured if exp['outcome'] > 0 else 0
+            
+            label_text = 'Measured Data' if i == 0 else ""
+            plt.errorbar(d_mean, sf_measured, yerr=y_err, fmt='o', color='black', capsize=3, label=label_text)
+
+        plt.yscale('log')
+        plt.xlabel("Dose [Gy]")
+        plt.ylabel("Survival Fraction (SF)")
+        plt.title(f"LQL Cell Survival Curve ({self.cell_line})")
+        plt.legend()
+        plt.grid(True, which="both", alpha=0.3)
+        plt.ylim(0.001, 1.2)
+        plt.show()
+
+    def calculate_ld50(self):
+        """Calculates LD50 considering the piecewise LQL nature."""
+        if self.idata is None: return None
+        post = self.idata.posterior
+        a = post['alpha'].values.flatten()
+        b = post['beta'].values.flatten()
+        dt = post['d_t'].values.flatten()
+        
+        target_log_s = -np.log(2)
+        ld50_samples = np.zeros_like(a)
+        
+        log_s_at_dt = -a * dt - b * (dt**2)
+        mask_lq = target_log_s >= log_s_at_dt 
+        
+        # LQ szakaszon lévők kiszámítása
+        disc = a**2 - 4 * b * (-np.log(2))
+        ld50_samples[mask_lq] = (-a[mask_lq] + np.sqrt(disc[mask_lq])) / (2 * b[mask_lq])
+        
+        # Lineáris szakaszon lévők kiszámítása
+        slope = -a - 2 * b * dt
+        ld50_samples[~mask_lq] = dt[~mask_lq] + (target_log_s - log_s_at_dt[~mask_lq]) / slope[~mask_lq]
+        
+        mean_ld50 = np.mean(ld50_samples)
+        hpd_low = np.percentile(ld50_samples, 2.5)
+        hpd_high = np.percentile(ld50_samples, 97.5)
+        return mean_ld50, (hpd_low, hpd_high)
+        
+    def calculate_rbe(self, ref_ld50, ref_ld50_std=0.0):
+        """Calculates RBE relative to a reference LD50."""
+        if self.idata is None: return
+        print(f"\n--- RBE Calculation (Ref LD50: {ref_ld50:.2f} Gy) ---")
+        
+        post = self.idata.posterior
+        a = post['alpha'].values.flatten()
+        b = post['beta'].values.flatten()
+        dt = post['d_t'].values.flatten()
+        
+        target_log_s = -np.log(2)
+        ld50_test_samples = np.zeros_like(a)
+        
+        log_s_at_dt = -a * dt - b * (dt**2)
+        mask_lq = target_log_s >= log_s_at_dt 
+        
+        disc = a**2 - 4 * b * (-np.log(2))
+        ld50_test_samples[mask_lq] = (-a[mask_lq] + np.sqrt(disc[mask_lq])) / (2 * b[mask_lq])
+        slope = -a - 2 * b * dt
+        ld50_test_samples[~mask_lq] = dt[~mask_lq] + (target_log_s - log_s_at_dt[~mask_lq]) / slope[~mask_lq]
+        
+        n_samples = len(ld50_test_samples)
+        if ref_ld50_std > 0:
+            ld50_ref_samples = np.random.normal(ref_ld50, ref_ld50_std, n_samples)
+        else:
+            ld50_ref_samples = np.full(n_samples, ref_ld50)
+            
+        rbe_samples = ld50_ref_samples / ld50_test_samples
+        mean_rbe = np.mean(rbe_samples)
+        
+        import arviz as az
+        hdi = az.hdi(rbe_samples, hdi_prob=0.95)
+        
+        print(f"RBE (via LD50): {mean_rbe:.2f}")
+        print(f"95% Credible Interval: [{hdi[0]:.2f}, {hdi[1]:.2f}]")
+        
+        plt.figure(figsize=(6, 4))
+        plt.hist(rbe_samples, bins=50, density=True, alpha=0.7, color='darkred')
+        plt.axvline(mean_rbe, color='k', linestyle='--', label=f'Mean: {mean_rbe:.2f}')
+        plt.xlabel("RBE Value")
+        plt.title(f"RBE Probability Distribution ({self.name})")
+        plt.legend()
+        plt.show()
+        
+        return mean_rbe, hdi
 
 # ==============================================================================
 # 2. FISH MODEL: SURVIVAL ANALYSIS (Weibull)
@@ -2071,9 +2286,16 @@ class BioModelComparator:
                 continue
 
             try:
-                obs_counts = model.idata.observed_data['colony_counts'].values
-                if 'n_seeded' in model.idata.constant_data:
+                # Dinamikus változónév-keresés (így az 'obs' és a 'colony_counts' is működik)
+                obs_keys = list(model.idata.observed_data.data_vars.keys())
+                obs_var = 'colony_counts' if 'colony_counts' in obs_keys else ('obs' if 'obs' in obs_keys else obs_keys[0])
+                obs_counts = model.idata.observed_data[obs_var].values
+                
+                # Sejtszám visszakeresése
+                if hasattr(model.idata, 'constant_data') and 'n_seeded' in model.idata.constant_data:
                     n_seeds = model.idata.constant_data['n_seeded'].values
+                elif hasattr(model, 'experiments') and len(model.experiments) > 0:
+                    n_seeds = np.array([e['n_seeded'] for e in model.experiments])
                 else:
                     n_seeds = np.ones_like(obs_counts) * 2000
                 
@@ -2081,14 +2303,17 @@ class BioModelComparator:
                 sf_obs = (obs_counts / n_seeds) / pe_mean
                 
                 ppc = model.idata.posterior_predictive
-                pred_counts_mean = ppc['colony_counts_pred'].mean(dim=["chain", "draw"]).values
+                ppc_keys = list(ppc.data_vars.keys())
+                ppc_var = f"{obs_var}_pred" if f"{obs_var}_pred" in ppc_keys else (obs_var if obs_var in ppc_keys else ppc_keys[0])
+                
+                pred_counts_mean = ppc[ppc_var].mean(dim=["chain", "draw"]).values
                 sf_pred = (pred_counts_mean / n_seeds) / pe_mean
                 
-                pred_low = ppc['colony_counts_pred'].quantile(0.025, dim=["chain", "draw"]).values
-                pred_high = ppc['colony_counts_pred'].quantile(0.975, dim=["chain", "draw"]).values
+                pred_low = ppc[ppc_var].quantile(0.025, dim=["chain", "draw"]).values
+                pred_high = ppc[ppc_var].quantile(0.975, dim=["chain", "draw"]).values
                 
-                sf_err_low = sf_obs - ((pred_low / n_seeds) / pe_mean)
-                sf_err_high = ((pred_high / n_seeds) / pe_mean) - sf_obs
+                sf_err_low = np.maximum(sf_obs - ((pred_low / n_seeds) / pe_mean), 0)
+                sf_err_high = np.maximum(((pred_high / n_seeds) / pe_mean) - sf_obs, 0)
                 
                 all_vals = np.concatenate([sf_obs.flatten(), sf_pred.flatten()])
                 valid_vals = all_vals[all_vals > 0]
@@ -2107,7 +2332,7 @@ class BioModelComparator:
                 ax.grid(True, which="both", alpha=0.3)
                 ax.legend()
                 
-            except KeyError as e:
+            except Exception as e:
                 print(f"ERROR ({name}): Data error in idata: {e}")
 
         plt.tight_layout()

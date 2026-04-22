@@ -139,7 +139,7 @@ def generate_fig4_heterogeneity():
     ax3.set_xlim(-2, 42)
 
     # Mentés és megjelenítés
-    filename = "fig4_heterogeneity_correction.png"
+    filename = "fig5_heterogeneity_correction.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"Kész! Ábra elmentve mint: {filename}")
     plt.show()

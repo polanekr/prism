@@ -169,7 +169,7 @@ def generate_local_planes_survival(pdd_folder: str, front_film_path: str, rear_f
     cbar.set_ticks(ticks)
     cbar.set_ticklabels([f'$10^{{{t:.1f}}}$' for t in ticks])
 
-    filename = "fig9_local_planes_survival_final.png"
+    filename = "fig12_voxel_radiobiology.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"\nKész! Ábra elmentve mint: {filename}")
     plt.show()

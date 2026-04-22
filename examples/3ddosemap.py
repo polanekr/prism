@@ -19,7 +19,7 @@ def generate_global_beam_figure(pdd_folder):
     
     # 1. Térfogat felépítése
     recon = Bayesian3DVolumeReconstructor(pdd_folder=pdd_folder, ssd_mm=300.0)
-    recon.build_volume(roi_size_mm=60.0, z_res_mm=0.5, perform_alignment=True, divergence_correction=True)
+    recon.build_volume(roi_size_mm=50.0, z_res_mm=0.5, perform_alignment=True, divergence_correction=True)
     
     vol = recon.volume
     coords = recon.coords

@@ -1,7 +1,20 @@
+"""
+NOTE: This script generates Figure 7, which serves as a purely conceptual, 
+pedagogical demonstration of "Cold-Spot Sheltering" and "False Radioresistance".
+To keep the visual demonstration mathematically clean and isolated from sampling 
+noise, this script uses synthetic bimodal dose distributions and deterministic 
+curve fitting (scipy.optimize.curve_fit) rather than the full Bayesian PRISM pipeline.
+
+For the actual experimental validation using the PRISM PyMC MCMC framework, 
+please refer to `radiobiology3.py` (Figure 10).
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from scipy.optimize import curve_fit
+
+
 
 def generate_fig7_synthetic_composite():
     print("--- 7. Ábra: Szintetikus dDVH és Sejttúlélési Modell ---")
@@ -163,7 +176,7 @@ def generate_fig7_synthetic_composite():
     ax2.grid(True, which="minor", linestyle=':', alpha=0.3)
     ax2.legend(loc='lower left', fontsize=11)
 
-    filename = "fig7_synthetic_composite.png"
+    filename = "fig10_synthetic_composite.png"
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"Kész! Ábra elmentve mint: {filename}")
     plt.show()
