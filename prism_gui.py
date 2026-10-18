@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import numpy as np
 import tifffile
+import datetime
+import subprocess
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -18,15 +20,11 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 os.environ["PYQTGRAPH_QT_LIB"] = "PyQt5"
 import pyqtgraph as pg
 
-# Import custom dosimetry engine
 from dosimetry import GafchromicEngine, BAYES_AVAILABLE
-
-# PyQtGraph global configuration
 pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
 
-
 # =============================================================================
-# BLANK FILM ROI SELECTION DIALOG (Golyóálló, 16-bites számítással)
+# BLANK FILM ROI SELECTION DIALOG
 # =============================================================================
 class BlankRoiDialog(QDialog):
     def __init__(self, blank_path, parent=None):
@@ -58,17 +56,12 @@ class BlankRoiDialog(QDialog):
             raw_img = tifffile.imread(str(self.blank_path))
             if raw_img.ndim == 3 and raw_img.shape[2] > 3:
                 raw_img = raw_img[:, :, :3]
-            raw_img = np.flip(raw_img, axis=0) # Függőleges tükrözés
-            
-            # Ezt használjuk a PONTOS matematikai átlagszámításhoz (16-bit / eredeti)
+            raw_img = np.flip(raw_img, axis=0) 
             self.raw_img_data = raw_img.astype(np.float64)
-
-            # Ezt csak a képernyőn való MEGJELENÍTÉSHEZ használjuk (8-bit)
             if raw_img.dtype == np.uint16:
                 display_img = (raw_img / 256).astype(np.uint8)
             else:
                 display_img = raw_img.copy()
-
             self.img_item.setImage(display_img)
         except Exception as e:
             self.raw_img_data = np.zeros((500, 500, 3))
@@ -95,7 +88,6 @@ class BlankRoiDialog(QDialog):
 
     def update_stats(self):
         try:
-            # FIGYELEM: Az eredeti, RAW (pl. 16-bites) képből olvassuk ki a pixeleket!
             roi_data = self.roi.getArrayRegion(self.raw_img_data, self.img_item)
             if roi_data is not None and roi_data.size > 0:
                 if self.raw_img_data.ndim == 3:
@@ -129,19 +121,16 @@ class EngineWorker(QThread):
                 folder = self.kwargs.get('folder')
                 doses = self.kwargs.get('doses')
                 cleaning = self.kwargs.get('cleaning', False)
-                
                 orig_out = self.engine.output_folder
                 self.engine.output_folder = folder
-                
                 if method == 'mcmc':
                     if not BAYES_AVAILABLE:
                         raise RuntimeError("PyMC/ArviZ packages are not available for MCMC calibration!")
                     self.engine.run_mcmc_calibration(folder, doses, use_cleaning=cleaning)
                 else:
                     self.engine.run_calibration(folder, doses)
-                
                 self.engine.output_folder = orig_out
-                self.finished.emit("Calibration completed successfully and saved to the calibration folder!")
+                self.finished.emit("Calibration completed successfully!")
 
             elif self.task_type == 'process':
                 files = self.kwargs.get('files')
@@ -149,7 +138,6 @@ class EngineWorker(QThread):
                 method = self.kwargs.get('method')
                 cleaning = self.kwargs.get('cleaning')
                 blank_rgb = self.kwargs.get('blank_rgb')
-                
                 self.engine.process_films(files, blank, method=method, use_cleaning=cleaning, blank_rgb=blank_rgb)
                 self.finished.emit(f"Successfully converted {len(files)} film(s) to dose maps!")
                 
@@ -177,8 +165,6 @@ class PrismDosimetryGUI(QMainWindow):
         self.current_raw_img = None
         self.current_meta = {}
         self.current_film_name = "dose_map"
-        
-        # Globális változó a Blank ROI átlagának tárolására
         self.global_blank_rgb = None
 
         self._init_ui()
@@ -187,33 +173,31 @@ class PrismDosimetryGUI(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
-
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
-
         control_panel = self._create_control_panel()
         splitter.addWidget(control_panel)
-
         self.tabs = QTabWidget()
         splitter.addWidget(self.tabs)
-
         self.viewer_tab = self._create_viewer_tab()
-        self.tabs.addTab(self.viewer_tab, "🔍 2D Dose Map & Profiles")
-
-        self.gamma_tab = self._create_placeholder_tab("Gamma Analysis & Profiles", "WIP")
-        self.tabs.addTab(self.gamma_tab, "📊 Gamma Analysis (WIP)")
-
-        self.tab_3d = self._create_placeholder_tab("3D Dose Volume Reconstruction", "WIP")
-        self.tabs.addTab(self.tab_3d, "🧊 3D Reconstruction (WIP)")
-
+        self.tabs.addTab(self.viewer_tab, "🔍 2D Dose Map & Dashboard")
+        self.tabs.addTab(self._create_placeholder_tab("Gamma Analysis & Profiles", "WIP"), "📊 Gamma Analysis (WIP)")
+        self.tabs.addTab(self._create_placeholder_tab("3D Dose Volume Reconstruction", "WIP"), "🧊 3D Reconstruction (WIP)")
         splitter.setSizes([390, 1260])
 
     def _create_control_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
+        # 1. Project Session
         proj_group = QGroupBox("1. Project Session")
         proj_layout = QVBoxLayout(proj_group)
+
+        self.btn_new_proj_scan = QPushButton("🆕 New Project & Open Scanner")
+        self.btn_new_proj_scan.setStyleSheet("font-weight: bold; background-color: #2b8a3e; color: white;")
+        self.btn_new_proj_scan.clicked.connect(self.create_project_and_launch_scanner)
+        proj_layout.addWidget(self.btn_new_proj_scan)
+
         self.btn_open_proj = QPushButton("📁 Open / Create Project Folder")
         self.btn_open_proj.clicked.connect(self.select_project_folder)
         self.btn_refresh = QPushButton("🔄 Refresh File Lists")
@@ -225,7 +209,8 @@ class PrismDosimetryGUI(QMainWindow):
         proj_layout.addWidget(self.lbl_proj_path)
         layout.addWidget(proj_group)
 
-        calib_group = QGroupBox("2. Calibration (Shared Folder)")
+        # 2. Calibration
+        calib_group = QGroupBox("2. Calibration")
         calib_layout = QVBoxLayout(calib_group)
         self.btn_sel_calib_dir = QPushButton("📂 Select Calibration Folder")
         self.btn_sel_calib_dir.clicked.connect(self.select_calibration_folder)
@@ -233,7 +218,7 @@ class PrismDosimetryGUI(QMainWindow):
         self.lbl_calib_status.setStyleSheet("color: #d9534f; font-weight: bold;")
         calib_layout.addWidget(self.btn_sel_calib_dir)
         calib_layout.addWidget(self.lbl_calib_status)
-        calib_layout.addWidget(QLabel("Doses [Gy] (comma-separated, 0 = blank):"))
+        calib_layout.addWidget(QLabel("Doses [Gy]:"))
         self.input_doses = QLineEdit("0, 1, 2, 4, 6, 8, 10")
         calib_layout.addWidget(self.input_doses)
         hbox_cal_opt = QHBoxLayout()
@@ -253,29 +238,24 @@ class PrismDosimetryGUI(QMainWindow):
         calib_layout.addLayout(hbox_cal_btns)
         layout.addWidget(calib_group)
 
-        conv_group = QGroupBox("3. Conversion (raw -> processed)")
+        # 3. Conversion
+        conv_group = QGroupBox("3. Conversion")
         conv_layout = QVBoxLayout(conv_group)
-        conv_layout.addWidget(QLabel("Raw scanned films (Ctrl/Shift for multi-select):"))
+        conv_layout.addWidget(QLabel("Raw scanned films:"))
         self.list_raw_files = QListWidget()
         self.list_raw_files.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_raw_files.itemClicked.connect(self.on_raw_file_clicked)
         conv_layout.addWidget(self.list_raw_files)
         
-        conv_layout.addWidget(QLabel("Unexposed (Blank / 0 Gy) reference film:"))
-        
-        # --- ÚJ: Blank ROI Kijelölő Gomb ---
+        conv_layout.addWidget(QLabel("Unexposed (Blank / 0 Gy) reference:"))
         blank_hbox = QHBoxLayout()
         self.combo_blank_film = QComboBox()
         self.combo_blank_film.currentIndexChanged.connect(self._invalidate_blank_rgb)
-        
         self.btn_set_blank_roi = QPushButton("🎯 Set ROI")
-        self.btn_set_blank_roi.setToolTip("Select a clean area on the blank film to use as global background reference")
         self.btn_set_blank_roi.clicked.connect(self.open_blank_roi_dialog)
-        
         blank_hbox.addWidget(self.combo_blank_film)
         blank_hbox.addWidget(self.btn_set_blank_roi)
         conv_layout.addLayout(blank_hbox)
-        # -----------------------------------
 
         conv_layout.addWidget(QLabel("Solver method:"))
         self.combo_solver = QComboBox()
@@ -292,10 +272,10 @@ class PrismDosimetryGUI(QMainWindow):
         hbox_conv_btns.addWidget(self.btn_conv_selected)
         hbox_conv_btns.addWidget(self.btn_conv_all)
         conv_layout.addLayout(hbox_conv_btns)
-        
         layout.addWidget(conv_group)
 
-        proc_group = QGroupBox("4. Processed Dose Maps (processed)")
+        # 4. Processed
+        proc_group = QGroupBox("4. Processed Dose Maps")
         proc_layout = QVBoxLayout(proc_group)
         self.list_proc_files = QListWidget()
         self.list_proc_files.itemClicked.connect(self.on_proc_file_clicked)
@@ -303,10 +283,8 @@ class PrismDosimetryGUI(QMainWindow):
         layout.addWidget(proc_group)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
-
         return panel
 
     def _create_viewer_tab(self):
@@ -314,6 +292,7 @@ class PrismDosimetryGUI(QMainWindow):
         main_v_layout = QVBoxLayout(tab)
         images_splitter = QSplitter(Qt.Horizontal)
 
+        # LEFT: Raw Film
         raw_widget = QWidget()
         raw_layout = QVBoxLayout(raw_widget)
         raw_layout.setContentsMargins(0, 0, 0, 0)
@@ -328,25 +307,30 @@ class PrismDosimetryGUI(QMainWindow):
         raw_layout.addWidget(self.glw_raw)
         images_splitter.addWidget(raw_widget)
 
-        dose_widget = QWidget()
-        dose_layout = QVBoxLayout(dose_widget)
-        dose_layout.setContentsMargins(0, 0, 0, 0)
+        # RIGHT: Dashboard Export Wrapper (Ez menti le egyben a képet, táblázatot, grafikont!)
+        self.export_widget = QWidget()
+        self.export_widget.setStyleSheet("QWidget { background-color: #1a1a1a; color: #EEEEEE; }")
+        export_layout = QVBoxLayout(self.export_widget)
+        export_layout.setContentsMargins(5, 5, 5, 5)
         
+        # Dashboard Header
         header_hbox = QHBoxLayout()
-        header_hbox.addWidget(QLabel("<b>Converted Dose Map [Gy] (Drag crosshair & elliptical ROI!)</b>"))
-        self.btn_save_snapshot = QPushButton("📸 Save Dose Map Snapshot (with Overlay)")
+        header_hbox.addWidget(QLabel("<b>Converted Dose Map [Gy] & QA Dashboard</b>"))
+        self.btn_save_snapshot = QPushButton("📸 Save Full Dashboard Report")
+        self.btn_save_snapshot.setStyleSheet("font-weight: bold; background-color: #0078D7; color: white;")
         self.btn_save_snapshot.clicked.connect(self.save_dose_snapshot)
         header_hbox.addStretch()
         header_hbox.addWidget(self.btn_save_snapshot)
-        dose_layout.addLayout(header_hbox)
+        export_layout.addLayout(header_hbox)
 
+        # Dose Map & Profiles
         self.glw_dose = pg.GraphicsLayoutWidget()
         
         self.plot_prof_y = self.glw_dose.addPlot(row=0, col=0)
         self.plot_prof_y.setLabel('bottom', 'Dose [Gy]')
         self.plot_prof_y.setLabel('left', 'Y (CAX) [mm]')
-        self.plot_prof_y.setMaximumWidth(185)
         self.curve_prof_y = self.plot_prof_y.plot(pen=pg.mkPen('c', width=2))
+        self.plot_prof_y.setFixedWidth(210)
 
         self.plot_dose = self.glw_dose.addPlot(row=0, col=1)
         self.plot_dose.setLabel('bottom', 'X [mm]')
@@ -358,19 +342,24 @@ class PrismDosimetryGUI(QMainWindow):
         self.colorbar = pg.HistogramLUTItem()
         self.colorbar.setImageItem(self.img_item_dose)
         self.colorbar.gradient.loadPreset('viridis')
+        self.colorbar.setMinimumWidth(110)
+        self.colorbar.setMaximumWidth(140)
         self.glw_dose.addItem(self.colorbar, row=0, col=2)
         self.colorbar.sigLevelsChanged.connect(self._on_lut_levels_changed)
         self.colorbar.sigLookupTableChanged.connect(self._on_lut_gradient_changed)
 
-        self.canvas_stats_label = pg.LabelItem(justify='left')
-        self.canvas_stats_label.setText("<b>ROI Stats:</b><br>No data", color='#EEEEEE')
-        self.glw_dose.addItem(self.canvas_stats_label, row=1, col=0)
-
         self.plot_prof_x = self.glw_dose.addPlot(row=1, col=1)
         self.plot_prof_x.setLabel('left', 'Dose [Gy]')
         self.plot_prof_x.setLabel('bottom', 'X (CAX) [mm]')
-        self.plot_prof_x.setMaximumHeight(185)
+        self.plot_prof_x.setMinimumHeight(140)
         self.curve_prof_x = self.plot_prof_x.plot(pen=pg.mkPen('y', width=2))
+
+        # Arányok optimalizálása, hogy a térkép hatalmas legyen
+        self.glw_dose.ci.layout.setColumnStretchFactor(0, 2)
+        self.glw_dose.ci.layout.setColumnStretchFactor(1, 9)
+        self.glw_dose.ci.layout.setColumnStretchFactor(2, 1)
+        self.glw_dose.ci.layout.setRowStretchFactor(0, 7)
+        self.glw_dose.ci.layout.setRowStretchFactor(1, 3)
 
         self.v_line = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('y', width=1.5, style=Qt.DashLine))
         self.h_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('c', width=1.5, style=Qt.DashLine))
@@ -389,37 +378,64 @@ class PrismDosimetryGUI(QMainWindow):
         self.plot_dose.addItem(self.roi)
         self.roi.sigRegionChanged.connect(self.update_roi_stats)
 
-        dose_layout.addWidget(self.glw_dose)
-        images_splitter.addWidget(dose_widget)
-        images_splitter.setSizes([480, 780])
-        main_v_layout.addWidget(images_splitter, stretch=3)
+        export_layout.addWidget(self.glw_dose, stretch=4)
 
-        roi_group = QGroupBox("Elliptical ROI Spatial Statistics & Uncertainty")
-        roi_h_layout = QHBoxLayout(roi_group)
+        # --- TISZTA ALSÓ SÁV: Statisztika (Balra) és DVH (Jobbra) ---
+        bottom_panel = QWidget()
+        bottom_layout = QHBoxLayout(bottom_panel)
+        bottom_layout.setContentsMargins(0, 5, 0, 0)
 
-        stats_widget = QWidget()
-        stats_grid = QGridLayout(stats_widget)
-        self.lbl_roi_mean = QLabel("<b>Mean Dose:</b> - Gy")
-        self.lbl_roi_std = QLabel("<b>Spatial Std Dev:</b> - Gy")
-        self.lbl_roi_median = QLabel("<b>Median:</b> - Gy")
-        self.lbl_roi_min = QLabel("<b>Minimum:</b> - Gy")
-        self.lbl_roi_max = QLabel("<b>Maximum:</b> - Gy")
-        self.lbl_roi_pixels = QLabel("<b>ROI Area:</b> - mm² (- px)")
-        stats_grid.addWidget(self.lbl_roi_mean, 0, 0)
-        stats_grid.addWidget(self.lbl_roi_std, 1, 0)
-        stats_grid.addWidget(self.lbl_roi_median, 2, 0)
-        stats_grid.addWidget(self.lbl_roi_min, 0, 1)
-        stats_grid.addWidget(self.lbl_roi_max, 1, 1)
-        stats_grid.addWidget(self.lbl_roi_pixels, 2, 1)
-        roi_h_layout.addWidget(stats_widget, stretch=1)
+        # A) Klinikai Statisztikák Táblázat
+        self.stats_group = QGroupBox("Clinical Metrics & Beam QA")
+        self.stats_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; }")
+        stats_grid = QGridLayout(self.stats_group)
+        
+        # Col 0: ROI Data
+        self.lbl_roi_mean = QLabel("<b>Mean:</b> -")
+        self.lbl_roi_std = QLabel("<b>Spatial Std:</b> -")
+        self.lbl_roi_area = QLabel("<b>Area:</b> -")
+        stats_grid.addWidget(QLabel("<span style='color: #4CAF50;'><b>--- ROI Spatial ---</b></span>"), 0, 0)
+        stats_grid.addWidget(self.lbl_roi_mean, 1, 0)
+        stats_grid.addWidget(self.lbl_roi_std, 2, 0)
+        stats_grid.addWidget(self.lbl_roi_area, 3, 0)
+        
+        # Col 1: DVH & Meta
+        self.lbl_d90 = QLabel("<b>D90%:</b> -")
+        self.lbl_v95 = QLabel("<b>V95%:</b> -")
+        self.lbl_meta = QLabel("<b>Conv. Method:</b> -")
+        stats_grid.addWidget(QLabel("<span style='color: #FF9800;'><b>--- DVH / Meta ---</b></span>"), 0, 1)
+        stats_grid.addWidget(self.lbl_d90, 1, 1)
+        stats_grid.addWidget(self.lbl_v95, 2, 1)
+        stats_grid.addWidget(self.lbl_meta, 3, 1)
 
-        self.plot_roi_hist = pg.PlotWidget(title="ROI Dose Distribution (Histogram)")
+        # Col 2: Beam QA
+        self.lbl_qa_pen = QLabel("<b>Penumbra (X/Y):</b> - / - mm")
+        self.lbl_qa_flat = QLabel("<b>Flatness (X/Y):</b> - / -")
+        self.lbl_qa_symm = QLabel("<b>Symmetry (X/Y):</b> - / -")
+        stats_grid.addWidget(QLabel("<span style='color: #2196F3;'><b>--- Beam QA ---</b></span>"), 0, 2)
+        stats_grid.addWidget(self.lbl_qa_pen, 1, 2)
+        stats_grid.addWidget(self.lbl_qa_flat, 2, 2)
+        stats_grid.addWidget(self.lbl_qa_symm, 3, 2)
+
+        bottom_layout.addWidget(self.stats_group, stretch=1)
+
+        # B) Kumulatív DVH / Hisztogram
+        self.plot_roi_hist = pg.PlotWidget(title="ROI Dose Distribution (PDF & Cumulative DAH)")
         self.plot_roi_hist.setLabel('bottom', 'Dose [Gy]')
-        self.plot_roi_hist.setLabel('left', 'Count (Pixels)')
-        self.curve_roi_hist = self.plot_roi_hist.plot(stepMode="center", fillLevel=0, fillOutline=True, brush=(0, 150, 255, 100))
-        roi_h_layout.addWidget(self.plot_roi_hist, stretch=2)
+        self.plot_roi_hist.setLabel('left', 'Relative Volume [%]')
+        self.plot_roi_hist.setYRange(0, 105)
+        # Sima hisztogram (kék, kitöltött)
+        self.curve_roi_hist = self.plot_roi_hist.plot(stepMode="center", fillLevel=0, fillOutline=True, brush=(0, 150, 255, 60), pen=pg.mkPen('c'))
+        # Kumulatív DAH görbe (piros, vastag)
+        self.curve_roi_dah = self.plot_roi_hist.plot(pen=pg.mkPen('r', width=3))
+        
+        bottom_layout.addWidget(self.plot_roi_hist, stretch=1)
+        
+        export_layout.addWidget(bottom_panel, stretch=1)
+        images_splitter.addWidget(self.export_widget)
+        images_splitter.setSizes([300, 960])
 
-        main_v_layout.addWidget(roi_group, stretch=1)
+        main_v_layout.addWidget(images_splitter)
         return tab
 
     def _create_placeholder_tab(self, title, description):
@@ -432,28 +448,20 @@ class PrismDosimetryGUI(QMainWindow):
 
     # =========================================================================
     def _invalidate_blank_rgb(self):
-        """Törli a memóriából a Blank ROI-t, ha a felhasználó másik filmet választ a legördülőből."""
         self.global_blank_rgb = None
 
     def open_blank_roi_dialog(self):
-        """Megnyitja az ablakot, ahol a felhasználó kijelölheti az üres film referencia területét."""
         blank_name = self.combo_blank_film.currentText()
         if not blank_name:
             QMessageBox.warning(self, "Error", "No unexposed film selected!")
             return
-        
         blank_path = str(self.raw_dir / blank_name)
         dialog = BlankRoiDialog(blank_path, self)
         
         if dialog.exec_() == QDialog.Accepted and dialog.mean_rgb is not None:
             self.global_blank_rgb = dialog.mean_rgb
-            QMessageBox.information(
-                self, "Success", 
-                f"Blank reference ROI saved globally for this session!\n"
-                f"Mean RGB: R={self.global_blank_rgb[0]:.1f}, G={self.global_blank_rgb[1]:.1f}, B={self.global_blank_rgb[2]:.1f}"
-            )
+            QMessageBox.information(self, "Success", f"Blank reference ROI saved globally!\nMean RGB: R={self.global_blank_rgb[0]:.1f}, G={self.global_blank_rgb[1]:.1f}, B={self.global_blank_rgb[2]:.1f}")
 
-    # =========================================================================
     def _on_lut_levels_changed(self):
         if self.current_dose_map is not None:
             levels = self.colorbar.getLevels()
@@ -466,20 +474,71 @@ class PrismDosimetryGUI(QMainWindow):
 
     def save_dose_snapshot(self):
         if self.current_dose_map is None:
-            QMessageBox.warning(self, "No Dose Map", "Please load a converted dose map first!")
+            QMessageBox.warning(self, "No Dose Map", "Please load a dose map first!")
             return
+
         default_dir = str(self.analysis_dir) if self.analysis_dir else ""
-        default_name = f"{self.current_film_name}_snapshot.png"
+        default_name = f"{self.current_film_name}_report_300dpi.png"
         default_path = os.path.join(default_dir, default_name) if default_dir else default_name
 
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Snapshot", default_path, "PNG Image (*.png);;TIFF (*.tif *.tiff)")
-        if file_path:
-            try:
-                pixmap = self.glw_dose.grab()
-                pixmap.save(file_path)
-                QMessageBox.information(self, "Saved", f"Snapshot saved to:\n{file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to save snapshot:\n{e}")
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self, 
+            "Save Publication-Ready Figure", 
+            default_path, 
+            "High-Res PNG (*.png);;High-Res TIFF (*.tif *.tiff);;PDF Document (*.pdf)"
+        )
+        if not file_path:
+            return
+
+        try:
+            self.btn_save_snapshot.setVisible(False)  # Ne lógjon bele a gomb az ábrába
+            QApplication.processEvents()
+
+            # --- PUBLIKÁCIÓS MINŐSÉG: SKÁLÁZÁS (DPI TÖBBSZÖRÖZÉS) ---
+            # 1.0 = normál monitor (96 DPI)
+            # 3.0 = 300 DPI (Klinikai / folyóirat nyomdai szabvány)
+            # 4.0 = 400+ DPI (Ultra-fine)
+            SCALE_FACTOR = 3.2
+
+            target_size = self.export_widget.size() * SCALE_FACTOR
+
+            if file_path.lower().endswith('.pdf'):
+                # Vektoros PDF mentés QPdfWriter segítségével
+                from PyQt5.QtGui import QPainter, QPdfWriter, QPageSize
+                pdf_writer = QPdfWriter(file_path)
+                pdf_writer.setResolution(300) # 300 DPI
+                pdf_writer.setPageSize(QPageSize(QPageSize.A4))
+                painter = QPainter(pdf_writer)
+                self.export_widget.render(painter)
+                painter.end()
+            else:
+                # Nagy felbontású raszteres (PNG / TIFF) renderelés belső antialiasinggal
+                from PyQt5.QtGui import QImage, QPainter
+                image = QImage(target_size, QImage.Format_ARGB32_Premultiplied)
+                # Beállítjuk a logikai DPI metaadatot a fájlfejlécbe (300 DPI = ~11811 pixel/méter)
+                dpm = int(300 / 0.0254)
+                image.setDotsPerMeterX(dpm)
+                image.setDotsPerMeterY(dpm)
+                image.fill(Qt.transparent)
+
+                painter = QPainter(image)
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                painter.scale(SCALE_FACTOR, SCALE_FACTOR)
+                self.export_widget.render(painter)
+                painter.end()
+
+                image.save(file_path)
+
+            self.btn_save_snapshot.setVisible(True)
+            QMessageBox.information(
+                self, "Export Successful", 
+                f"Publication-ready figure saved at {int(96 * SCALE_FACTOR)} DPI:\n{file_path}\n"
+                f"Image Dimensions: {target_size.width()} × {target_size.height()} px"
+            )
+        except Exception as e:
+            self.btn_save_snapshot.setVisible(True)
+            QMessageBox.critical(self, "Export Error", f"Failed to save high-res figure:\n{e}")
 
     # =========================================================================
     def select_project_folder(self):
@@ -501,16 +560,74 @@ class PrismDosimetryGUI(QMainWindow):
         self.lbl_proj_path.setText(f"Active Project:\n{self.project_dir}")
         self.lbl_proj_path.setStyleSheet("color: #2b8a3e; font-weight: bold; font-size: 11px;")
         
-        # --- JAVÍTOTT RÉSZ ---
-        # Ha már létezik a feldolgozó motor (benne a kalibrációval), 
-        # NE hozzunk létre újat, csak frissítsük a kimeneti mappát!
         if self.engine is None:
             self.engine = GafchromicEngine(output_folder=str(self.processed_dir))
         else:
             self.engine.output_folder = str(self.processed_dir)
-        # ---------------------
-        
         self.refresh_file_lists()
+
+    def create_project_and_launch_scanner(self):
+        """Létrehoz egy új projekt mappát a három almappával, beállítja a PRISM-ben, 
+        majd közvetlenül elindítja a szkennelő programot a 'raw' mappára irányítva."""
+        parent_dir = QFileDialog.getExistingDirectory(
+            self, "Select Parent Folder for the New Project", 
+            str(self.project_dir.parent) if self.project_dir else str(Path.home())
+        )
+        if not parent_dir:
+            return
+
+        # Név bekérése az új projekthez
+        from PyQt5.QtWidgets import QInputDialog
+        default_name = f"Project_{datetime.datetime.now().strftime('%Y%m%d')}"
+        project_name, ok = QInputDialog.getText(
+            self, "New Project Name", "Enter folder name for the new project:",
+            text=default_name
+        )
+        if not ok or not project_name.strip():
+            return
+
+        new_project_path = Path(parent_dir) / project_name.strip()
+        
+        # 1. Mappastruktúra létrehozása
+        self.project_dir = new_project_path
+        self.raw_dir = self.project_dir / "raw"
+        self.processed_dir = self.project_dir / "processed"
+        self.analysis_dir = self.project_dir / "analysis"
+
+        try:
+            for d in [self.raw_dir, self.processed_dir, self.analysis_dir]:
+                d.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Directory Error", f"Failed to create project directories:\n{e}")
+            return
+
+        # PRISM felület és motor aktualizálása
+        self.lbl_proj_path.setText(f"Active Project:\n{self.project_dir}")
+        self.lbl_proj_path.setStyleSheet("color: #2b8a3e; font-weight: bold; font-size: 11px;")
+
+        if self.engine is None:
+            self.engine = GafchromicEngine(output_folder=str(self.processed_dir))
+        else:
+            self.engine.output_folder = str(self.processed_dir)
+
+        self.refresh_file_lists()
+
+        # 2. Szkennelő program indítása a 'raw' mappára paraméterezve
+        scanner_script = Path(__file__).parent / "scan.py"
+        if not scanner_script.exists():
+            QMessageBox.warning(self, "Scanner Missing", f"Could not find '{scanner_script.name}' in the project directory.")
+            return
+
+        try:
+            # Nem blokkoló háttérfolyamatként elindítjuk a Tkinter szkennelőt
+            subprocess.Popen([sys.executable, str(scanner_script), str(self.raw_dir)])
+            QMessageBox.information(
+                self, "Project Initialized", 
+                f"Project folder created successfully:\n{self.project_dir}\n\n"
+                f"The scanner application has been opened and pointed directly to:\n{self.raw_dir}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Execution Error", f"Failed to launch scanner script:\n{e}")
 
     def refresh_file_lists(self):
         if not self.project_dir: return
@@ -587,8 +704,6 @@ class PrismDosimetryGUI(QMainWindow):
         if not self.engine.calib_params:
             QMessageBox.warning(self, "Error", "No calibration loaded!")
             return
-        
-        # --- ELLENŐRZÉS: Be van állítva a Blank ROI? ---
         if self.global_blank_rgb is None:
             QMessageBox.warning(self, "Error", "Please set the Blank Film ROI first by clicking the '🎯 Set ROI' button!")
             return
@@ -612,7 +727,6 @@ class PrismDosimetryGUI(QMainWindow):
         self.engine.output_folder = str(self.processed_dir)
         self._set_ui_busy(True)
         
-        # A konverternek most már garantáltan átadjuk a 16-bites RGB átlagot!
         self.worker = EngineWorker('process', self.engine, files=file_paths, blank=blank_path, method=method, cleaning=cleaning, blank_rgb=self.global_blank_rgb)
         self.worker.finished.connect(self._on_process_finished)
         self.worker.error.connect(self._on_worker_error)
@@ -685,6 +799,10 @@ class PrismDosimetryGUI(QMainWindow):
             if meta_path.exists():
                 with open(meta_path, 'r') as f:
                     self.current_meta = json.load(f)
+                    
+            # Metaadat táblázat frissítése
+            method = self.current_meta.get("method", "Fast")
+            self.lbl_meta.setText(f"<b>Conv. Method:</b> {method.capitalize()}")
 
             min_d, max_d = float(np.min(dose_map)), float(np.max(dose_map))
             if min_d == max_d: max_d = min_d + 1.0
@@ -737,6 +855,40 @@ class PrismDosimetryGUI(QMainWindow):
             self.colorbar.setHistogramRange(min_d, max_d, padding=0.05)
         self.update_profiles(x1, x2, y1, y2)
 
+    def _calc_qa(self, prof, spacing):
+        """Kiszámolja a nyaláb minőségbiztosítási paramétereit a profilból"""
+        try:
+            if len(prof) < 5: return "-", "-", "-"
+            max_d = np.max(prof)
+            if max_d < 0.1: return "-", "-", "-"
+            
+            d80, d50, d20 = max_d * 0.8, max_d * 0.5, max_d * 0.2
+            above_50 = np.where(prof > d50)[0]
+            if len(above_50) < 2: return "-", "-", "-"
+            i50_L, i50_R = above_50[0], above_50[-1]
+            
+            above_80, above_20 = np.where(prof > d80)[0], np.where(prof > d20)[0]
+            if len(above_80) > 1 and len(above_20) > 1:
+                penumbra = ((abs(above_80[0] - above_20[0]) + abs(above_20[-1] - above_80[-1])) / 2.0) * spacing
+                pen_str = f"{penumbra:.1f}"
+            else: pen_str = "-"
+
+            width = i50_R - i50_L
+            c80_L, c80_R = i50_L + int(width * 0.1), i50_R - int(width * 0.1)
+            
+            if c80_R > c80_L:
+                c_prof = prof[c80_L:c80_R]
+                flatness = 100.0 * (np.max(c_prof) - np.min(c_prof)) / (np.max(c_prof) + np.min(c_prof))
+                mid = (i50_L + i50_R) // 2
+                half = min(mid - c80_L, c80_R - mid)
+                left, right = prof[mid - half : mid], prof[mid + 1 : mid + 1 + half][::-1]
+                if len(left) > 0 and len(left) == len(right):
+                    symm = 100.0 * np.max(np.abs(left - right)) / max_d
+                else: symm = 0.0
+                return pen_str, f"{flatness:.1f}%", f"{symm:.1f}%"
+            else: return pen_str, "-", "-"
+        except: return "-", "-", "-"
+
     def _on_crosshair_moved(self, *args):
         self.update_profiles()
 
@@ -756,11 +908,13 @@ class PrismDosimetryGUI(QMainWindow):
         c_x = int(np.clip(self.v_line.value(), 0, w - 1))
         c_y = int(np.clip(self.h_line.value(), 0, h - 1))
 
+        prof_x, prof_y = np.array([]), np.array([])
         if y1 <= c_y < y2:
             prof_x = self.current_dose_map[c_y, x1:x2]
             if len(prof_x) > 0:
                 x_mm = np.arange(x1, x2) * spacing
-                x_mm_shifted = x_mm - x_mm[np.argmax(prof_x)]
+                max_idx = np.argmax(prof_x)
+                x_mm_shifted = x_mm - x_mm[max_idx]
                 self.curve_prof_x.setData(x_mm_shifted, prof_x)
             else: self.curve_prof_x.setData([], [])
         else: self.curve_prof_x.setData([], [])
@@ -769,10 +923,16 @@ class PrismDosimetryGUI(QMainWindow):
             prof_y = self.current_dose_map[y1:y2, c_x]
             if len(prof_y) > 0:
                 y_mm = np.arange(y1, y2) * spacing
-                y_mm_shifted = y_mm - y_mm[np.argmax(prof_y)]
-                self.curve_prof_y.setData(prof_y, y_mm_shifted)
+                self.curve_prof_y.setData(prof_y, y_mm - y_mm[np.argmax(prof_y)])
             else: self.curve_prof_y.setData([], [])
         else: self.curve_prof_y.setData([], [])
+
+        # Nyaláb QA frissítése
+        pen_x, flat_x, symm_x = self._calc_qa(prof_x, spacing)
+        pen_y, flat_y, symm_y = self._calc_qa(prof_y, spacing)
+        self.lbl_qa_pen.setText(f"<b>Penumbra (X/Y):</b> {pen_x} / {pen_y} mm")
+        self.lbl_qa_flat.setText(f"<b>Flatness (X/Y):</b> {flat_x} / {flat_y}")
+        self.lbl_qa_symm.setText(f"<b>Symmetry (X/Y):</b> {symm_x} / {symm_y}")
 
     def update_roi_stats(self):
         if self.current_dose_map is None: return
@@ -792,45 +952,38 @@ class PrismDosimetryGUI(QMainWindow):
 
         mean_val = float(np.mean(valid_pixels))
         spatial_std = float(np.std(valid_pixels))
-        min_val = float(np.min(valid_pixels))
         max_val = float(np.max(valid_pixels))
-        median_val = float(np.median(valid_pixels))
         num_px = int(valid_pixels.size)
 
         pixel_spacing_mm = float(self.current_meta.get("pixel_spacing_mm", 0.0846))
         area_mm2 = num_px * (pixel_spacing_mm ** 2)
-        diam_x_mm = rw * pixel_spacing_mm
-        diam_y_mm = rh * pixel_spacing_mm
 
         sys_err_ratio = 0.04
         mean_unc = np.sqrt((mean_val * sys_err_ratio)**2 + (spatial_std / np.sqrt(num_px))**2)
-        median_unc = median_val * sys_err_ratio
-        min_unc = min_val * sys_err_ratio
-        max_unc = max_val * sys_err_ratio
 
-        self.lbl_roi_mean.setText(f"<b>Mean Dose:</b> {mean_val:.3f} ± {mean_unc:.3f} Gy")
-        self.lbl_roi_std.setText(f"<b>Spatial Std Dev:</b> {spatial_std:.3f} Gy")
-        self.lbl_roi_median.setText(f"<b>Median:</b> {median_val:.3f} ± {median_unc:.3f} Gy")
-        self.lbl_roi_min.setText(f"<b>Minimum:</b> {min_val:.3f} ± {min_unc:.3f} Gy")
-        self.lbl_roi_max.setText(f"<b>Maximum:</b> {max_val:.3f} ± {max_unc:.3f} Gy")
-        self.lbl_roi_pixels.setText(f"<b>ROI Area:</b> {area_mm2:.2f} mm² (Ø {diam_x_mm:.1f} × {diam_y_mm:.1f} mm)")
+        # DVH mutatók számítása
+        d90 = np.percentile(valid_pixels, 10) # D90 (A terület 90%-a legalább ekkora dózist kapott)
+        v95 = np.sum(valid_pixels >= 0.95 * max_val) / num_px * 100.0 # V95 (A terület hány %-a kapta meg a max 95%-át)
 
-        stats_html = (
-            f"<div style='font-size: 10pt; color: #FFFFFF;'>"
-            f"<b>File:</b> {self.current_film_name}<br>"
-            f"<b>Mean:</b> {mean_val:.3f} &plusmn; {mean_unc:.3f} Gy<br>"
-            f"<b>Spatial Std:</b> {spatial_std:.3f} Gy<br>"
-            f"<b>Median:</b> {median_val:.3f} &plusmn; {median_unc:.3f} Gy<br>"
-            f"<b>Min / Max:</b> {min_val:.2f} &plusmn; {min_unc:.2f} / {max_val:.2f} &plusmn; {max_unc:.2f} Gy<br>"
-            f"<b>Area:</b> {area_mm2:.2f} mm&sup2;<br>"
-            f"<b>Diameters:</b> {diam_x_mm:.1f} &times; {diam_y_mm:.1f} mm"
-            f"</div>"
-        )
-        self.canvas_stats_label.setText(stats_html)
+        self.lbl_roi_mean.setText(f"<b>Mean:</b> {mean_val:.3f} ± {mean_unc:.3f} Gy")
+        self.lbl_roi_std.setText(f"<b>Spatial Std:</b> {spatial_std:.3f} Gy")
+        self.lbl_roi_area.setText(f"<b>Area:</b> {area_mm2:.1f} mm² (Ø {rw*pixel_spacing_mm:.1f}x{rh*pixel_spacing_mm:.1f})")
+        
+        self.lbl_d90.setText(f"<b>D90%:</b> {d90:.3f} Gy")
+        self.lbl_v95.setText(f"<b>V95%:</b> {v95:.1f} %")
 
-        y, x = np.histogram(valid_pixels, bins=40)
-        self.curve_roi_hist.setData(x, y)
+        # Hisztogram (PDF) és Kumulatív DAH frissítése
+        y, x = np.histogram(valid_pixels, bins=50)
+        bin_centers = (x[:-1] + x[1:]) / 2
+        
+        # Normalizálás 0-100% közötti relatív volumenre
+        y_norm = y / np.max(y) * 100.0 if np.max(y) > 0 else y
+        self.curve_roi_hist.setData(x, y_norm)
 
+        # Kumulatív DAH (felülről lefelé)
+        cum_y = np.cumsum(y[::-1])[::-1]
+        cum_y_norm = cum_y / np.max(cum_y) * 100.0 if np.max(cum_y) > 0 else cum_y
+        self.curve_roi_dah.setData(bin_centers, cum_y_norm)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
