@@ -13,9 +13,10 @@ from PyQt5.QtWidgets import (
     QGridLayout, QPushButton, QLabel, QFileDialog, QListWidget, 
     QComboBox, QCheckBox, QLineEdit, QGroupBox, QTabWidget, 
     QSplitter, QMessageBox, QProgressBar, QAbstractItemView,
-    QDialog, QDialogButtonBox, QSlider, QSpinBox, QGraphicsPathItem 
+    QDialog, QDialogButtonBox, QSlider, QSpinBox, QGraphicsPathItem,
+    QTextEdit, QScrollArea
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPainter, QPageSize, QPdfWriter, QPainterPath
 from matplotlib.figure import Figure
 from scipy.ndimage import gaussian_filter, map_coordinates
@@ -26,7 +27,6 @@ import pyqtgraph as pg
 
 from dosimetry import GafchromicEngine, BAYES_AVAILABLE
 pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
-
 
 # =============================================================================
 # 2D GAUSSIAN FITTING FUNCTION (ROTATED ELLIPTICAL GAUSSIAN)
@@ -39,6 +39,14 @@ def twoD_Gaussian(xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
     g = offset + amplitude * np.exp(- (a * ((x - xo)**2) + 2 * b * (x - xo) * (y - yo) + c * ((y - yo)**2)))
     return g.ravel()
 
+class EmittingStream(QObject):
+    textWritten = pyqtSignal(str)
+    
+    def write(self, text):
+        self.textWritten.emit(str(text))
+        
+    def flush(self):
+        pass
 
 # =============================================================================
 # BLANK FILM ROI SELECTION DIALOG
@@ -178,6 +186,7 @@ class PrismDosimetryGUI(QMainWindow):
         
         self.engine = None
         self.current_dose_map = None
+        self.current_std_map = None
         self.current_raw_img = None
         self.current_meta = {}
         self.current_film_name = "dose_map"
@@ -192,6 +201,9 @@ class PrismDosimetryGUI(QMainWindow):
 
         self._init_ui()
 
+        sys.stdout = EmittingStream(textWritten=self.normalOutputWritten)
+        sys.stderr = EmittingStream(textWritten=self.normalOutputWritten)
+
     def _init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -199,8 +211,13 @@ class PrismDosimetryGUI(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
         
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMinimumWidth(380)
+        
         control_panel = self._create_control_panel()
-        splitter.addWidget(control_panel)
+        scroll_area.setWidget(control_panel)
+        splitter.addWidget(scroll_area)
         
         self.tabs = QTabWidget()
         splitter.addWidget(self.tabs)
@@ -313,6 +330,26 @@ class PrismDosimetryGUI(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
+
+        # Folyamatjelző
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0) # Végtelenített indikátor futás közben
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+
+        # Beágyazott Konzol Kimenet
+        layout.addWidget(QLabel("<b>Élő folyamat (Konzol kimenet):</b>"))
+        self.console_output = QTextEdit()
+        self.console_output.setReadOnly(True)
+        # Explicit szövegkijelölés engedélyezése:
+        self.console_output.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        # Saját görgetősáv kikényszerítése:
+        self.console_output.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Hacker-stílusú fekete hátteres terminál megjelenés:
+        self.console_output.setStyleSheet("background-color: #1e1e1e; color: #00FF00; font-family: Consolas, monospace; font-size: 11px;")
+        self.console_output.setMinimumHeight(100) # Elég magas legyen a progress barokhoz
+        layout.addWidget(self.console_output)
+
         return panel
 
     def _create_viewer_tab(self):
@@ -364,71 +401,86 @@ class PrismDosimetryGUI(QMainWindow):
 
         main_v_layout.addLayout(tool_layout)
 
-        # --- KÖZÖS KOMPOZIT EXPORT KONTRÉNER (Splitter helyett egyetlen widget a hibátlan mentéshez) ---
+        main_splitter = QSplitter(Qt.Vertical)
+        main_v_layout.addWidget(main_splitter)
+
+        # ==========================================
+        # FELSŐ RÉSZ: Képek (Nyers és Dózis)
+        # ==========================================
         self.composite_export_container = QWidget()
         self.composite_export_container.setStyleSheet("QWidget { background-color: #1a1a1a; color: #EEEEEE; }")
-        comp_layout = QHBoxLayout(self.composite_export_container)
+        comp_layout = QVBoxLayout(self.composite_export_container)
         comp_layout.setContentsMargins(4, 4, 4, 4)
         comp_layout.setSpacing(8)
 
-        # 1. BAL OLDAL: Nyers szkennelt film panelje
-        self.raw_widget = QWidget()
-        raw_layout = QVBoxLayout(self.raw_widget)
+        images_splitter = QSplitter(Qt.Horizontal)
+
+        # 1. BAL PANEL: Nyers Film
+        raw_widget = QWidget()
+        raw_layout = QVBoxLayout(raw_widget)
         raw_layout.setContentsMargins(0, 0, 0, 0)
-        self.lbl_raw_header = QLabel("<b>Raw Scanned Film (RGB) with Synced Reticle</b>")
-        raw_layout.addWidget(self.lbl_raw_header)
+        raw_layout.addWidget(QLabel("<b>Raw Scanned Film (RGB) with Synced Reticle</b>"))
         
         self.glw_raw = pg.GraphicsLayoutWidget()
         self.plot_raw = self.glw_raw.addPlot()
         self.plot_raw.setAspectLocked(True)
+        self.plot_raw.invertY(True)
         self.plot_raw.setLabel('bottom', 'X [mm]')
         self.plot_raw.setLabel('left', 'Y [mm]')
         self.img_item_raw = pg.ImageItem()
         self.plot_raw.addItem(self.img_item_raw)
-        
-        # Szinkronizált célkereszt a nyers filmen
-        self.v_line_raw = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('m', width=1.5, style=Qt.DashLine))
-        self.h_line_raw = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('m', width=1.5, style=Qt.DashLine))
+
+        self.v_line_raw = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('y', width=1.5, style=Qt.DashLine))
+        self.h_line_raw = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('c', width=1.5, style=Qt.DashLine))
         self.plot_raw.addItem(self.v_line_raw, ignoreBounds=True)
         self.plot_raw.addItem(self.h_line_raw, ignoreBounds=True)
-        raw_layout.addWidget(self.glw_raw)
 
-        # 2. JOBB OLDAL: Teljes dózistérkép és LWFA Analytics Dashboard
-        self.export_widget = QWidget()
-        export_layout = QVBoxLayout(self.export_widget)
-        export_layout.setContentsMargins(0, 0, 0, 0)
+        raw_layout.addWidget(self.glw_raw)
+        images_splitter.addWidget(raw_widget)
+
+        # 2. JOBB PANEL: Konvertált Dózistérkép + Tengelyprofilok + Színskála
+        dose_widget = QWidget()
+        dose_layout = QVBoxLayout(dose_widget)
+        dose_layout.setContentsMargins(0, 0, 0, 0)
         
         header_hbox = QHBoxLayout()
-        header_hbox.addWidget(QLabel("<b>Beam Dose Map [Gy] & LWFA Analytics</b>"))
+        self.lbl_map_title = QLabel("<b>Beam Dose Map [Gy] & LWFA Analytics</b>")
+        header_hbox.addWidget(self.lbl_map_title)
+        self.btn_toggle_map = QPushButton("👁️ Bizonytalanság (STD) Mutatása")
+        self.btn_toggle_map.setCheckable(True)
+        self.btn_toggle_map.setStyleSheet("font-weight: bold; background-color: #f0ad4e; color: black;")
+        self.btn_toggle_map.clicked.connect(self._toggle_map_view)
+        header_hbox.addWidget(self.btn_toggle_map)
         self.btn_save_snapshot = QPushButton("📸 Save Publication Figure (300 DPI)")
         self.btn_save_snapshot.setStyleSheet("font-weight: bold; background-color: #0078D7; color: white;")
         self.btn_save_snapshot.clicked.connect(self.save_dose_snapshot)
         header_hbox.addStretch()
         header_hbox.addWidget(self.btn_save_snapshot)
-        export_layout.addLayout(header_hbox)
+        dose_layout.addLayout(header_hbox)
 
-        # Graphics Layout a dózistérképnek és a profiloknak
         self.glw_dose = pg.GraphicsLayoutWidget()
         
         self.plot_prof_y = self.glw_dose.addPlot(row=0, col=0)
         self.plot_prof_y.setLabel('bottom', 'Dose [Gy]')
         self.plot_prof_y.setLabel('left', 'Y (CAX) [mm]')
-        self.plot_prof_y.setFixedWidth(200)
+        self.plot_prof_y.invertY(True)
+        self.plot_prof_y.setMaximumWidth(180)
         self.curve_prof_y = self.plot_prof_y.plot(pen=self.pen_prof_y)
 
         self.plot_dose = self.glw_dose.addPlot(row=0, col=1)
         self.plot_dose.setLabel('bottom', 'X [mm]')
         self.plot_dose.setLabel('left', 'Y [mm]')
         self.plot_dose.setAspectLocked(True)
+        self.plot_dose.invertY(True)
 
-        # Kétrétegű megjelenítés (Split View): Z-értékek negatívak, hogy a tengelyek előtte legyenek
         self.img_item_raw_bg = pg.ImageItem()
         self.img_item_raw_bg.setZValue(-10)
         self.plot_dose.addItem(self.img_item_raw_bg)
-        
+
         self.img_item_dose = pg.ImageItem(autoDownsample=False)
         self.img_item_dose.setZValue(-5)
         self.plot_dose.addItem(self.img_item_dose)
+        self.plot_prof_y.setYLink(self.plot_dose)
 
         self.colorbar = pg.HistogramLUTItem()
         self.colorbar.setImageItem(self.img_item_dose)
@@ -442,9 +494,10 @@ class PrismDosimetryGUI(QMainWindow):
         self.plot_prof_x = self.glw_dose.addPlot(row=1, col=1)
         self.plot_prof_x.setLabel('left', 'Dose [Gy]')
         self.plot_prof_x.setLabel('bottom', 'Axis / Path [mm]')
-        self.plot_prof_x.setFixedHeight(190)
+        self.plot_prof_x.setMaximumHeight(180)
         self.curve_prof_x = self.plot_prof_x.plot(pen=self.pen_prof_x)
         self.curve_prof_fit = self.plot_prof_x.plot(pen=pg.mkPen('r', width=1.5, style=Qt.DashLine))
+        self.plot_prof_x.setXLink(self.plot_dose)
 
         self.glw_dose.ci.layout.setColumnStretchFactor(0, 0)
         self.glw_dose.ci.layout.setColumnStretchFactor(1, 10)
@@ -452,7 +505,6 @@ class PrismDosimetryGUI(QMainWindow):
         self.glw_dose.ci.layout.setRowStretchFactor(0, 8)
         self.glw_dose.ci.layout.setRowStretchFactor(1, 0)
 
-        # Célkeresztek
         self.v_line = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('y', width=1.5, style=Qt.DashLine))
         self.h_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('c', width=1.5, style=Qt.DashLine))
         self.plot_dose.addItem(self.v_line, ignoreBounds=True)
@@ -460,27 +512,30 @@ class PrismDosimetryGUI(QMainWindow):
         self.v_line.sigPositionChanged.connect(self._on_crosshair_moved)
         self.h_line.sigPositionChanged.connect(self._on_crosshair_moved)
 
-        # Ferde vonalzó (Oblique Line ROI)
         self.line_roi = pg.LineSegmentROI([[20, 20], [80, 80]], pen=pg.mkPen('y', width=2.5))
         self.line_roi.sigRegionChanged.connect(self._on_oblique_moved)
         self.plot_dose.addItem(self.line_roi)
         self.line_roi.hide()
 
-        # Film boundary (Piros keret)
         self.film_boundary = pg.RectROI([10, 10], [100, 100], pen=pg.mkPen('r', width=1.5, style=Qt.DashLine))
         self.film_boundary.addScaleHandle([1, 1], [0, 0])
         self.film_boundary.addScaleHandle([0, 0], [1, 1])
         self.plot_dose.addItem(self.film_boundary)
         self.film_boundary.sigRegionChanged.connect(self.update_boundary_and_profiles)
 
-        # Nyaláb ROI (Fehér ellipszis)
         self.roi = pg.EllipseROI([50, 50], [100, 100], pen=pg.mkPen('w', width=2))
         self.plot_dose.addItem(self.roi)
         self.roi.sigRegionChanged.connect(self.update_roi_stats)
 
-        export_layout.addWidget(self.glw_dose, stretch=4)
+        dose_layout.addWidget(self.glw_dose)
+        images_splitter.addWidget(dose_widget)
+        images_splitter.setSizes([500, 720])
+        
+        comp_layout.addWidget(images_splitter, stretch=3)
 
-        # ALSÓ SÁV: 4 oszlopos metrikák és hisztogram / DAH
+        # ==========================================
+        # ALSÓ RÉSZ: ROI Statisztikák (Teljes szélesség)
+        # ==========================================
         bottom_panel = QWidget()
         bottom_layout = QHBoxLayout(bottom_panel)
         bottom_layout.setContentsMargins(2, 2, 2, 2)
@@ -494,7 +549,6 @@ class PrismDosimetryGUI(QMainWindow):
         stats_grid.setHorizontalSpacing(6)
         stats_grid.setVerticalSpacing(2)
         
-        # Col 0: Spot Geometry & Pointing (Fantombeli profil)
         self.lbl_beam_peak = QLabel("<b>Peak:</b> - Gy @ (-, -) mm")
         self.lbl_beam_com = QLabel("<b>CoM:</b> (-, -) mm")
         self.lbl_beam_fwhm = QLabel("<b>FWHM (X/Y):</b> - / - mm")
@@ -505,7 +559,6 @@ class PrismDosimetryGUI(QMainWindow):
         stats_grid.addWidget(self.lbl_beam_fwhm, 3, 0)
         stats_grid.addWidget(self.lbl_roi_area, 4, 0)
 
-        # Col 1: 2D Model (Fantombeli szóródási modell)
         self.lbl_fit_amp = QLabel("<b>Fit Amp:</b> - Gy")
         self.lbl_fit_sigma = QLabel("<b>Spread (σx, σy):</b> - , - mm")
         self.lbl_fit_theta = QLabel("<b>Tilt Angle (θ):</b> - deg")
@@ -516,18 +569,19 @@ class PrismDosimetryGUI(QMainWindow):
         stats_grid.addWidget(self.lbl_fit_theta, 3, 1)
         stats_grid.addWidget(self.lbl_total_dose, 4, 1)
 
-        # Col 2: Fantom Dózisstatisztika és Térbeli Eltérés
         self.lbl_dose_stats = QLabel("<b>Mean Dose:</b> - Gy")
         self.lbl_dose_std = QLabel("<b>Spatial STD:</b> ±- Gy (- %)")
+        self.lbl_roi_uncert = QLabel("<b>Model Uncertainty:</b> - Gy")
+        self.lbl_roi_uncert.setStyleSheet("color: #d9534f; font-weight: bold;")
         self.lbl_dose_minmax = QLabel("<b>Min / Max:</b> - / - Gy")
         self.lbl_d90_val = QLabel("<b>D90%:</b> - Gy (V95%: -%)")
         stats_grid.addWidget(QLabel("<span style='color: #2196F3;'><b>--- Phantom Dose ---</b></span>"), 0, 2)
         stats_grid.addWidget(self.lbl_dose_stats, 1, 2)
         stats_grid.addWidget(self.lbl_dose_std, 2, 2)
-        stats_grid.addWidget(self.lbl_dose_minmax, 3, 2)
-        stats_grid.addWidget(self.lbl_d90_val, 4, 2)
+        stats_grid.addWidget(self.lbl_roi_uncert, 3, 2)
+        stats_grid.addWidget(self.lbl_dose_minmax, 4, 2)
+        stats_grid.addWidget(self.lbl_d90_val, 5, 2)
 
-        # Col 3: QA & Method
         self.lbl_penumbra = QLabel("<b>Penumbra (80-20):</b> - mm")
         self.lbl_flatness = QLabel("<b>Flatness:</b> - %")
         self.lbl_symmetry = QLabel("<b>Symmetry:</b> - %")
@@ -540,7 +594,6 @@ class PrismDosimetryGUI(QMainWindow):
 
         bottom_layout.addWidget(self.stats_group, stretch=3)
 
-        # DAH & Profile Chart
         self.plot_roi_hist = pg.PlotWidget(title="Beam Dose Distribution & Cumulative DAH")
         self.plot_roi_hist.setLabel('bottom', 'Dose [Gy]')
         self.plot_roi_hist.setLabel('left', 'Relative Area [%]')
@@ -553,13 +606,9 @@ class PrismDosimetryGUI(QMainWindow):
         self.curve_roi_dah = self.plot_roi_hist.plot(pen=self.pen_dah)
         
         bottom_layout.addWidget(self.plot_roi_hist, stretch=2)
-        export_layout.addWidget(bottom_panel, stretch=1)
+        comp_layout.addWidget(bottom_panel, stretch=1)
 
-        # Mindkét panelt (nyers kép és komplett elemző tábla) beletesszük a közös konténerbe
-        comp_layout.addWidget(self.raw_widget, stretch=1)
-        comp_layout.addWidget(self.export_widget, stretch=3)
-
-        main_v_layout.addWidget(self.composite_export_container)
+        main_splitter.addWidget(self.composite_export_container)
         return tab
 
     def _create_placeholder_tab(self, title, description):
@@ -661,12 +710,14 @@ class PrismDosimetryGUI(QMainWindow):
             self.line_roi.hide()
             self.plot_prof_y.show()
             self.plot_prof_x.setLabel('bottom', 'X (CAX) [mm]')
+            self.plot_prof_x.setXLink(self.plot_dose)  # Visszaláncoljuk a fő képre
         else:  # Oblique
             self.v_line.hide()
             self.h_line.hide()
             self.line_roi.show()
             self.plot_prof_y.hide()
             self.plot_prof_x.setLabel('bottom', 'Oblique Path [mm]')
+            self.plot_prof_x.setXLink(None)  # Ferde vonalnál leválasztjuk az X-tengelyt!
         self.update_profiles()
 
     def _toggle_isodose(self, checked):
@@ -1014,6 +1065,22 @@ class PrismDosimetryGUI(QMainWindow):
         self.worker.error.connect(self._on_worker_error)
         self.worker.start()
 
+    def normalOutputWritten(self, text):
+        if text.startswith('\r'):
+            text = text.replace('\r', '')
+            current_text = self.console_output.toPlainText()
+            
+            last_newline = current_text.rfind('\n')
+            if last_newline != -1:
+                self.console_output.setPlainText(current_text[:last_newline + 1])
+            else:
+                self.console_output.clear()
+        
+        self.console_output.insertPlainText(text)
+        
+        scrollbar = self.console_output.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def _on_calib_finished(self, msg):
         self._set_ui_busy(False)
         self.lbl_calib_status.setText(f"✅ Active ({self.calib_dir.name})")
@@ -1117,6 +1184,16 @@ class PrismDosimetryGUI(QMainWindow):
             dose_map = np.load(str(dose_path)).astype(np.float32)
             dose_map = np.flip(dose_map, axis=0)
             self.current_dose_map = dose_map
+            
+            # --- ÚJ: std térkép betöltése ---
+            std_path = dose_path.with_name(dose_path.name.replace("_dose.npy", "_std.npy"))
+            if std_path.exists():
+                std_map = np.load(str(std_path)).astype(np.float32)
+                self.current_std_map = np.flip(std_map, axis=0)
+            else:
+                self.current_std_map = None
+            # --------------------------------
+            
             self.current_film_name = dose_path.stem.replace("_dose", "")
 
             meta_path = dose_path.with_name(dose_path.name.replace("_dose.npy", "_meta.json"))
@@ -1155,12 +1232,59 @@ class PrismDosimetryGUI(QMainWindow):
             self.plot_raw.getAxis('bottom').setScale(spacing)
             self.plot_raw.getAxis('left').setScale(spacing)
 
+            # A profilok tengelyfeliratait is mm-re skálázzuk, miközben az adat pixel marad!
+            self.plot_prof_x.getAxis('bottom').setScale(spacing)
+            self.plot_prof_y.getAxis('left').setScale(spacing)
+
             self.plot_dose.autoRange()
             self._toggle_isodose(self.chk_isodose.isChecked())
             self.update_boundary_and_profiles()
             self.update_roi_stats()
         except Exception as e:
             QMessageBox.critical(self, "Dose Map Error", f"Failed to load dose map:\n{e}")
+
+    def _toggle_map_view(self):
+        """Vált a Dózistérkép és a Bizonytalansági (STD) térkép között."""
+        if self.current_dose_map is None:
+            self.btn_toggle_map.setChecked(False)
+            return
+
+        is_std_mode = self.btn_toggle_map.isChecked()
+
+        if is_std_mode:
+            if self.current_std_map is None:
+                QMessageBox.warning(self, "Hiányzó Fájl", "Nincs _std.npy térkép betöltve ehhez a filmhez!")
+                self.btn_toggle_map.setChecked(False)
+                return
+            
+            # STD térkép megjelenítése (Piros/Fekete kontrasztos nézet)
+            self.btn_toggle_map.setText("👁️ Vissza a Dózisra")
+            self.btn_toggle_map.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold;")
+            self.lbl_map_title.setText("<b>Model Uncertainty (STD) Map [Gy]</b>")
+            
+            map_to_show = self.current_std_map
+            cmap = 'inferno' # Hőtérkép a hibák kiemelésére
+        else:
+            # Vissza a normál Dózistérképre
+            self.btn_toggle_map.setText("👁️ Bizonytalanság (STD) Mutatása")
+            self.btn_toggle_map.setStyleSheet("font-weight: bold; background-color: #f0ad4e; color: black;")
+            self.lbl_map_title.setText("<b>Beam Dose Map [Gy] & LWFA Analytics</b>")
+            
+            map_to_show = self.current_dose_map
+            cmap = self.combo_cmap.currentText()
+
+        # Színskála és kép frissítése a robusztus maximummal
+        min_d = float(np.percentile(map_to_show, 1))
+        max_d = float(np.percentile(map_to_show, 99.5))
+        if min_d >= max_d: max_d = min_d + 1.0
+
+        self.img_item_dose.setImage(map_to_show, autoLevels=False)
+        self.colorbar.setLevels(min_d, max_d)
+        self.img_item_dose.setLevels((min_d, max_d), update=True)
+        self.colorbar.gradient.loadPreset(cmap)
+        
+        # Profilok frissítése az új térképpel
+        self.update_profiles()
 
     def update_boundary_and_profiles(self):
         if self.current_dose_map is None: return
@@ -1175,11 +1299,15 @@ class PrismDosimetryGUI(QMainWindow):
 
         active_data = self.current_dose_map[y1:y2, x1:x2]
         if active_data.size > 0:
-            min_d, max_d = float(np.min(active_data)), float(np.max(active_data))
-            if min_d == max_d: max_d = min_d + 1.0
+            # Sima min/max helyett robusztus percentilis a műtermékek ignorálására!
+            min_d = float(np.percentile(active_data, 1))
+            max_d = float(np.percentile(active_data, 99.5))
+            if min_d >= max_d: max_d = min_d + 1.0
+            
             self.colorbar.setLevels(min_d, max_d)
             self.img_item_dose.setLevels((min_d, max_d), update=True)
             self.colorbar.setHistogramRange(min_d, max_d, padding=0.05)
+            
         self.update_profiles(x1, x2, y1, y2)
 
     def _on_crosshair_moved(self, *args):
@@ -1193,9 +1321,9 @@ class PrismDosimetryGUI(QMainWindow):
         self.update_profiles()
 
     def update_profiles(self, x1=None, x2=None, y1=None, y2=None):
+        if not hasattr(self, 'v_line') or not hasattr(self, 'h_line'): return
         if self.current_dose_map is None: return
         h, w = self.current_dose_map.shape
-        spacing = float(self.current_meta.get("pixel_spacing_mm", 0.0846))
         band = self.spin_band.value()
 
         if not isinstance(x1, (int, float, np.integer, np.floating)):
@@ -1209,16 +1337,13 @@ class PrismDosimetryGUI(QMainWindow):
         # 1. Oblique Profile Mode
         if self.combo_prof_mode.currentIndex() == 1:
             handles = self.line_roi.getHandles()
-            if len(handles) < 2:
-                return
+            if len(handles) < 2: return
 
-            # A vonalzó két végpontjának lekérdezése (képpont koordinátákban)
             p1 = self.line_roi.mapToParent(handles[0].pos())
             p2 = self.line_roi.mapToParent(handles[1].pos())
             x0, y0 = float(p1.x()), float(p1.y())
             x1_pt, y1_pt = float(p2.x()), float(p2.y())
 
-            # A vonal hossza képpontban és fizikai mm-ben
             dx = x1_pt - x0
             dy = y1_pt - y0
             length_px = np.hypot(dx, dy)
@@ -1231,7 +1356,6 @@ class PrismDosimetryGUI(QMainWindow):
             cx_line = x0 + t * dx
             cy_line = y0 + t * dy
 
-            # Sávos átlagolás a merőleges normálvektor mentén (Band Width)
             nx = -dy / length_px
             ny = dx / length_px
             half_band = band // 2
@@ -1242,44 +1366,47 @@ class PrismDosimetryGUI(QMainWindow):
                 for off in offsets:
                     sample_x = cx_line + off * nx
                     sample_y = cy_line + off * ny
-                    coords = np.vstack([sample_y, sample_x])  # row-major: sor (Y), oszlop (X)
+                    coords = np.vstack([sample_y, sample_x])
                     sampled = map_coordinates(self.current_dose_map, coords, order=1, mode='nearest')
                     all_profiles.append(sampled)
                 prof = np.mean(all_profiles, axis=0)
             else:
-                coords = np.vstack([cy_line, cx_line])  # row-major: [Y, X]
+                coords = np.vstack([cy_line, cx_line])
                 prof = map_coordinates(self.current_dose_map, coords, order=1, mode='nearest')
 
-            # Fizikai távolságtengely kiszámítása mm-ben a vonalzó mentén
-            s_axis_mm = np.linspace(0, length_px * spacing, num_samples)
-
-            self.curve_prof_x.setData(s_axis_mm, prof)
+            # Fontos: A tengely pixelben van megadva, a grafikon setScale() állítja mm-re!
+            s_axis_px = np.linspace(0, length_px, num_samples)
+            self.curve_prof_x.setData(s_axis_px, prof)
             self.curve_prof_fit.setData([], [])
+            
+            # Ferde módnál autoRange a profil hossza miatt
+            self.plot_prof_x.autoRange()
             return
 
         # 2. Orthogonal Profiles (with Band Averaging)
         c_x = int(np.clip(self.v_line.value(), 0, w - 1))
         c_y = int(np.clip(self.h_line.value(), 0, h - 1))
 
-        # X Profile (Averaged across Band)
+        # X Profile
         y_low = max(y1, c_y - band // 2)
         y_high = min(y2, c_y + band // 2 + 1)
         if y_high > y_low:
             prof_x = np.mean(self.current_dose_map[y_low:y_high, x1:x2], axis=0)
             if len(prof_x) > 0:
-                x_mm = np.arange(x1, x2) * spacing
-                self.curve_prof_x.setData(x_mm - x_mm[np.argmax(prof_x)], prof_x, pen=self.pen_prof_x)
+                # Eredeti hiba: levontuk a csúcsot és szoroztuk spacinggel. Most szinkronban marad!
+                x_px = np.arange(x1, x2)
+                self.curve_prof_x.setData(x_px, prof_x, pen=self.pen_prof_x)
             else: self.curve_prof_x.setData([], [])
         else: self.curve_prof_x.setData([], [])
 
-        # Y Profile (Averaged across Band)
+        # Y Profile
         x_low = max(x1, c_x - band // 2)
         x_high = min(x2, c_x + band // 2 + 1)
         if x_high > x_low:
             prof_y = np.mean(self.current_dose_map[y1:y2, x_low:x_high], axis=1)
             if len(prof_y) > 0:
-                y_mm = np.arange(y1, y2) * spacing
-                self.curve_prof_y.setData(prof_y, y_mm - y_mm[np.argmax(prof_y)], pen=self.pen_prof_y)
+                y_px = np.arange(y1, y2)
+                self.curve_prof_y.setData(prof_y, y_px, pen=self.pen_prof_y)
             else: self.curve_prof_y.setData([], [])
         else: self.curve_prof_y.setData([], [])
 
@@ -1287,6 +1414,7 @@ class PrismDosimetryGUI(QMainWindow):
     # ADVANCED LWFA BEAM METRICS & 2D GAUSSIAN FIT
     # =========================================================================
     def update_roi_stats(self):
+        if not hasattr(self, 'roi') or not hasattr(self, 'line_roi'): return
         if self.current_dose_map is None: return
         roi_data = self.roi.getArrayRegion(self.current_dose_map, self.img_item_dose)
         if roi_data is None or roi_data.size == 0: return
@@ -1316,6 +1444,21 @@ class PrismDosimetryGUI(QMainWindow):
 
         # Térbeli dózisszórás (százalékban a fantomon belüli homogenitásra)
         spatial_cov_pct = (std_val / mean_val * 100.0) if mean_val > 0 else 0.0
+
+        # --- ÚJ: 1/B. Modell Bizonytalanság kinyerése (_std.npy) ugyanazzal a maszkkal ---
+        if hasattr(self, 'current_std_map') and self.current_std_map is not None:
+            roi_std_data = self.roi.getArrayRegion(self.current_std_map, self.img_item_dose)
+            if roi_std_data is not None and roi_std_data.shape == roi_data.shape:
+                valid_std_pixels = roi_std_data[ellipse_mask]
+                mean_uncert = float(np.mean(valid_std_pixels))
+                # Dózissal súlyozott relatív bizonytalanság (hogy a háttérzaj ne torzítsa a %-ot)
+                active_px = valid_pixels > (0.2 * max_val)
+                if np.any(active_px):
+                    rel_uncert = float(np.mean(valid_std_pixels[active_px] / valid_pixels[active_px]) * 100.0)
+                else:
+                    rel_uncert = (mean_uncert / mean_val * 100.0) if mean_val > 0 else 0.0
+            else:
+                mean_uncert, rel_uncert = None, None
 
         # 2. Orvosfizikai lefedettség: D90% és V95%
         # D90%: A dózis, amit a pixelek 90%-a meghalad (10. percentilis)
@@ -1386,6 +1529,13 @@ class PrismDosimetryGUI(QMainWindow):
         self.lbl_flatness.setText(f"<b>Flatness:</b> {flatness_pct}")
         self.lbl_symmetry.setText(f"<b>Symmetry:</b> {symmetry_pct}")
         self.lbl_conv_method.setText(f"<b>Method:</b> {method_disp}")
+
+        # --- ÚJ: Bizonytalanság (Uncertainty) címke frissítése ---
+        if hasattr(self, 'lbl_roi_uncert'):
+            if mean_uncert is not None:
+                self.lbl_roi_uncert.setText(f"<b>Model Uncertainty:</b> ±{mean_uncert:.3f} Gy ({rel_uncert:.1f}%)")
+            else:
+                self.lbl_roi_uncert.setText("<b>Model Uncertainty:</b> N/A (Nincs _std.npy)")
 
         # 7. Hisztogram és DAH diagram frissítése
         y, x = np.histogram(valid_pixels, bins=50)
