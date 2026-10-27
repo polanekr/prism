@@ -31,12 +31,15 @@ pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
 # =============================================================================
 # 2D GAUSSIAN FITTING FUNCTION (ROTATED ELLIPTICAL GAUSSIAN)
 # =============================================================================
-def twoD_Gaussian(xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
+def twoD_SuperGaussian(xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset, P):
     x, y = xy
-    a = (np.cos(theta)**2) / (2 * sigma_x**2) + (np.sin(theta)**2) / (2 * sigma_y**2)
-    b = -(np.sin(2 * theta)) / (4 * sigma_x**2) + (np.sin(2 * theta)) / (4 * sigma_y**2)
-    c = (np.sin(theta)**2) / (2 * sigma_x**2) + (np.cos(theta)**2) / (2 * sigma_y**2)
-    g = offset + amplitude * np.exp(- (a * ((x - xo)**2) + 2 * b * (x - xo) * (y - yo) + c * ((y - yo)**2)))
+    # Koordinátarendszer elforgatása
+    xr = (x - xo) * np.cos(theta) - (y - yo) * np.sin(theta)
+    yr = (x - xo) * np.sin(theta) + (y - yo) * np.cos(theta)
+    # Normált ellipszis egyenlete
+    E = (xr**2) / (2 * sigma_x**2) + (yr**2) / (2 * sigma_y**2)
+    # Super-Gaussian: exp(-E^P)
+    g = offset + amplitude * np.exp(-np.power(np.maximum(E, 0), P))
     return g.ravel()
 
 class EmittingStream(QObject):
@@ -80,7 +83,6 @@ class BlankRoiDialog(QDialog):
             raw_img = tifffile.imread(str(self.blank_path))
             if raw_img.ndim == 3 and raw_img.shape[2] > 3:
                 raw_img = raw_img[:, :, :3]
-            raw_img = np.flip(raw_img, axis=0) 
             self.raw_img_data = raw_img.astype(np.float64)
             if raw_img.dtype == np.uint16:
                 display_img = (raw_img / 256).astype(np.uint8)
@@ -475,6 +477,10 @@ class PrismDosimetryGUI(QMainWindow):
         self.plot_prof_y.invertY(True)
         self.plot_prof_y.setMaximumWidth(180)
         self.curve_prof_y = self.plot_prof_y.plot(pen=self.pen_prof_y)
+        self.curve_prof_y_up = pg.PlotCurveItem(pen=pg.mkPen(None))
+        self.curve_prof_y_dn = pg.PlotCurveItem(pen=pg.mkPen(None))
+        self.fill_prof_y = pg.FillBetweenItem(self.curve_prof_y_dn, self.curve_prof_y_up, brush=(0, 170, 255, 60))
+        self.plot_prof_y.addItem(self.fill_prof_y)
 
         self.plot_dose = self.glw_dose.addPlot(row=0, col=1)
         self.plot_dose.setLabel('bottom', 'X [mm]')
@@ -505,8 +511,17 @@ class PrismDosimetryGUI(QMainWindow):
         self.plot_prof_x.setLabel('bottom', 'Axis / Path [mm]')
         self.plot_prof_x.setMaximumHeight(180)
         self.curve_prof_x = self.plot_prof_x.plot(pen=self.pen_prof_x)
+        self.curve_prof_x_up = pg.PlotCurveItem(pen=pg.mkPen(None))
+        self.curve_prof_x_dn = pg.PlotCurveItem(pen=pg.mkPen(None))
+        self.fill_prof_x = pg.FillBetweenItem(self.curve_prof_x_dn, self.curve_prof_x_up, brush=(255, 170, 0, 60))
+        self.plot_prof_x.addItem(self.fill_prof_x)
         self.curve_prof_fit = self.plot_prof_x.plot(pen=pg.mkPen('r', width=1.5, style=Qt.DashLine))
         self.plot_prof_x.setXLink(self.plot_dose)
+
+        # Szuper-Gauss illesztés 50%-os (FWHM) kontúrja a 2D térképen
+        self.fit_contour = pg.PlotCurveItem(pen=pg.mkPen('w', width=2.0, style=Qt.DashLine))
+        self.fit_contour.setZValue(10)
+        self.plot_dose.addItem(self.fit_contour)
 
         self.glw_dose.ci.layout.setColumnStretchFactor(0, 0)
         self.glw_dose.ci.layout.setColumnStretchFactor(1, 10)
@@ -805,9 +820,11 @@ class PrismDosimetryGUI(QMainWindow):
                             self.isocurves.append(curve)
 
     def _toggle_roi_visibility(self, visible: bool):
-        """Elrejti vagy megjeleníti az analízis ellipszist (ROI), miközben a számítások megmaradnak."""
+        """Elrejti vagy megjeleníti az analízis ellipszist (ROI) és az illesztés kontúrját."""
         if hasattr(self, 'roi') and self.roi is not None:
             self.roi.setVisible(visible)
+        if hasattr(self, 'fit_contour') and self.fit_contour is not None:
+            self.fit_contour.setVisible(visible)
 
     def _update_blended_view(self):
         """Hardveres, azonnali rétegkeverés opacitással (nem fehéredik ki, nem kavarja meg a színskálát)."""
@@ -1186,7 +1203,6 @@ class PrismDosimetryGUI(QMainWindow):
             img = tifffile.imread(str(path))
             if img.ndim == 3 and img.shape[2] > 3:
                 img = img[:, :, :3]
-            img = np.flip(img, axis=0)
             if img.dtype == np.uint16:
                 img_disp = (img / 256).astype(np.uint8)
             else:
@@ -1205,14 +1221,13 @@ class PrismDosimetryGUI(QMainWindow):
     def load_and_display_dose(self, dose_path: Path):
         try:
             dose_map = np.load(str(dose_path)).astype(np.float32)
-            dose_map = np.flip(dose_map, axis=0)
             self.current_dose_map = dose_map
             
             # --- ÚJ: std térkép betöltése ---
             std_path = dose_path.with_name(dose_path.name.replace("_dose.npy", "_std.npy"))
             if std_path.exists():
                 std_map = np.load(str(std_path)).astype(np.float32)
-                self.current_std_map = np.flip(std_map, axis=0)
+                self.current_std_map = std_map
             else:
                 self.current_std_map = None
             # --------------------------------
@@ -1357,81 +1372,65 @@ class PrismDosimetryGUI(QMainWindow):
             x2 = int(np.clip(pos.x() + size.x(), x1 + 1, w))
             y2 = int(np.clip(pos.y() + size.y(), y1 + 1, h))
 
-        # 1. Oblique Profile Mode
+        # Oblique (Ferde) mód
         if self.combo_prof_mode.currentIndex() == 1:
             handles = self.line_roi.getHandles()
             if len(handles) < 2: return
-
             p1 = self.line_roi.mapToParent(handles[0].pos())
             p2 = self.line_roi.mapToParent(handles[1].pos())
             x0, y0 = float(p1.x()), float(p1.y())
             x1_pt, y1_pt = float(p2.x()), float(p2.y())
 
-            dx = x1_pt - x0
-            dy = y1_pt - y0
+            dx, dy = x1_pt - x0, y1_pt - y0
             length_px = np.hypot(dx, dy)
-            if length_px < 2:
-                self.curve_prof_x.setData([], [])
-                return
+            if length_px < 2: return
 
             num_samples = int(np.ceil(length_px))
             t = np.linspace(0, 1, num_samples)
-            cx_line = x0 + t * dx
-            cy_line = y0 + t * dy
+            cx_line, cy_line = x0 + t * dx, y0 + t * dy
 
-            nx = -dy / length_px
-            ny = dx / length_px
-            half_band = band // 2
-
-            if band > 1 and half_band >= 1:
-                offsets = np.arange(-half_band, half_band + 1)
-                all_profiles = []
-                for off in offsets:
-                    sample_x = cx_line + off * nx
-                    sample_y = cy_line + off * ny
-                    coords = np.vstack([sample_y, sample_x])
-                    sampled = map_coordinates(self.current_dose_map, coords, order=1, mode='nearest')
-                    all_profiles.append(sampled)
-                prof = np.mean(all_profiles, axis=0)
-            else:
-                coords = np.vstack([cy_line, cx_line])
-                prof = map_coordinates(self.current_dose_map, coords, order=1, mode='nearest')
-
-            # Fontos: A tengely pixelben van megadva, a grafikon setScale() állítja mm-re!
+            coords = np.vstack([cy_line, cx_line])
+            prof = map_coordinates(self.current_dose_map, coords, order=1, mode='nearest')
+            
             s_axis_px = np.linspace(0, length_px, num_samples)
             self.curve_prof_x.setData(s_axis_px, prof)
-            self.curve_prof_fit.setData([], [])
             
-            # Ferde módnál autoRange a profil hossza miatt
+            if self.current_std_map is not None:
+                std_prof = map_coordinates(self.current_std_map, coords, order=1, mode='nearest')
+                self.curve_prof_x_up.setData(s_axis_px, prof + std_prof)
+                self.curve_prof_x_dn.setData(s_axis_px, np.maximum(0, prof - std_prof))
+            
             self.plot_prof_x.autoRange()
             return
 
-        # 2. Orthogonal Profiles (with Band Averaging)
+        # Orto-normális (X/Y) mód
         c_x = int(np.clip(self.v_line.value(), 0, w - 1))
         c_y = int(np.clip(self.h_line.value(), 0, h - 1))
 
-        # X Profile
-        y_low = max(y1, c_y - band // 2)
-        y_high = min(y2, c_y + band // 2 + 1)
+        # X Profil
+        y_low, y_high = max(y1, c_y - band // 2), min(y2, c_y + band // 2 + 1)
         if y_high > y_low:
             prof_x = np.mean(self.current_dose_map[y_low:y_high, x1:x2], axis=0)
-            if len(prof_x) > 0:
-                # Eredeti hiba: levontuk a csúcsot és szoroztuk spacinggel. Most szinkronban marad!
-                x_px = np.arange(x1, x2)
-                self.curve_prof_x.setData(x_px, prof_x, pen=self.pen_prof_x)
-            else: self.curve_prof_x.setData([], [])
-        else: self.curve_prof_x.setData([], [])
+            x_px = np.arange(x1, x2)
+            self.curve_prof_x.setData(x_px, prof_x)
+            
+            if self.current_std_map is not None:
+                # Szórás propagálása az átlagolt sávra
+                std_x = np.mean(self.current_std_map[y_low:y_high, x1:x2], axis=0)
+                self.curve_prof_x_up.setData(x_px, prof_x + std_x)
+                self.curve_prof_x_dn.setData(x_px, np.maximum(0, prof_x - std_x))
 
-        # Y Profile
-        x_low = max(x1, c_x - band // 2)
-        x_high = min(x2, c_x + band // 2 + 1)
+        # Y Profil
+        x_low, x_high = max(x1, c_x - band // 2), min(x2, c_x + band // 2 + 1)
         if x_high > x_low:
             prof_y = np.mean(self.current_dose_map[y1:y2, x_low:x_high], axis=1)
-            if len(prof_y) > 0:
-                y_px = np.arange(y1, y2)
-                self.curve_prof_y.setData(prof_y, y_px, pen=self.pen_prof_y)
-            else: self.curve_prof_y.setData([], [])
-        else: self.curve_prof_y.setData([], [])
+            y_px = np.arange(y1, y2)
+            self.curve_prof_y.setData(prof_y, y_px)
+            
+            if self.current_std_map is not None:
+                std_y = np.mean(self.current_std_map[y1:y2, x_low:x_high], axis=1)
+                self.curve_prof_y_up.setData(prof_y + std_y, y_px)
+                self.curve_prof_y_dn.setData(np.maximum(0, prof_y - std_y), y_px)
 
     # =========================================================================
     # ADVANCED LWFA BEAM METRICS & 2D GAUSSIAN FIT
@@ -1467,7 +1466,7 @@ class PrismDosimetryGUI(QMainWindow):
         integral_dose = float(np.sum(valid_pixels) * (spacing ** 2))
 
         # --- DINAMIKUS ZAJBECSLÉS A BLANK ROI ALAPJÁN (Hibatűrő blokk) ---
-        intrinsic_film_noise = mean_val * 0.010  # Biztonsági fallback
+        intrinsic_film_noise = mean_val * 0.010  
         try:
             if hasattr(self, 'global_blank_std') and self.global_blank_std is not None and self.global_blank_rgb is not None and self.engine and self.engine.calib_params:
                 blank_mean = np.array(self.global_blank_rgb, dtype=float)
@@ -1486,7 +1485,6 @@ class PrismDosimetryGUI(QMainWindow):
         except Exception as e:
             print(f"Warning: Blank ROI noise calculation skipped, using fallback. ({e})")
 
-        # Dekonvolvált (valódi) nyaláb-szórás:
         true_beam_std = np.sqrt(max(0.0, std_val**2 - intrinsic_film_noise**2))
         spatial_cov_pct = (std_val / mean_val * 100.0) if mean_val > 0 else 0.0
         true_beam_cov_pct = (true_beam_std / mean_val * 100.0) if mean_val > 0 else 0.0
@@ -1513,10 +1511,12 @@ class PrismDosimetryGUI(QMainWindow):
         v95_count = np.sum(valid_pixels >= 0.95 * max_val)
         v95_val = float((v95_count / num_px) * 100.0) if num_px > 0 else 0.0
 
-        # 3. Peak és Súlypont (CoM) koordináták
+        # 3. Peak és Súlypont (CoM) koordináták (JAVÍTOTT KOORDINÁTA-TRANSZFORMÁCIÓ)
         max_idx = np.unravel_index(np.argmax(roi_data * ellipse_mask), roi_data.shape)
-        peak_x_mm = (pos.x() + max_idx[1]) * spacing
-        peak_y_mm = (pos.y() + max_idx[0]) * spacing
+        # Lokális pixel átszámítása a forgatott ROI-ból a globális képbe
+        peak_pt = self.roi.mapToItem(self.img_item_dose, pg.Point(float(max_idx[1]), float(max_idx[0])))
+        peak_x_mm = peak_pt.x() * spacing
+        peak_y_mm = peak_pt.y() * spacing
 
         masked_d = np.where(ellipse_mask, roi_data, 0.0)
         tot_mass = np.sum(masked_d)
@@ -1524,8 +1524,10 @@ class PrismDosimetryGUI(QMainWindow):
             y_indices, x_indices = np.indices(roi_data.shape)
             com_x = np.sum(x_indices * masked_d) / tot_mass
             com_y = np.sum(y_indices * masked_d) / tot_mass
-            com_x_mm = (pos.x() + com_x) * spacing
-            com_y_mm = (pos.y() + com_y) * spacing
+            
+            com_pt = self.roi.mapToItem(self.img_item_dose, pg.Point(float(com_x), float(com_y)))
+            com_x_mm = com_pt.x() * spacing
+            com_y_mm = com_pt.y() * spacing
             
             var_x = np.sum(((x_indices - com_x) ** 2) * masked_d) / tot_mass
             var_y = np.sum(((y_indices - com_y) ** 2) * masked_d) / tot_mass
@@ -1542,13 +1544,50 @@ class PrismDosimetryGUI(QMainWindow):
         penumbra_mm = self._calc_penumbra(prof_x, prof_y, spacing)
         flatness_pct, symmetry_pct = self._calc_flatness_symmetry(prof_x)
 
-        # 5. 2D Aszimmetrikus Gauss-illesztés
-        fit_amp, sig_x, sig_y, theta_deg = self._fit_2d_gaussian(roi_data, ellipse_mask, spacing)
+        # 5. 2D Super-Gaussian illesztés és vizualizáció (JAVÍTOTT KOORDINÁTA-TRANSZFORMÁCIÓ)
+        fit_params = self._fit_2d_gaussian(roi_data, ellipse_mask, spacing)
+        if fit_params is not None:
+            amp, xo, yo, sig_x, sig_y, th, off, P = fit_params
+            self.lbl_fit_amp.setText(f"<b>Fit Amp:</b> {amp:.2f} Gy")
+            self.lbl_fit_sigma.setText(f"<b>Spread:</b> {sig_x:.2f}, {sig_y:.2f} mm")
+            self.lbl_fit_theta.setText(f"<b>Tilt:</b> {np.degrees(th):.1f}° | <b>Shape (P):</b> {P:.2f}")
+            
+            E_50 = np.power(np.log(2.0), 1.0 / P)
+            t_angles = np.linspace(0, 2 * np.pi, 100)
+            xr = sig_x * np.sqrt(2 * E_50) * np.cos(t_angles)
+            yr = sig_y * np.sqrt(2 * E_50) * np.sin(t_angles)
+            
+            # Paraméteres kontúr a lokális koordinátarendszerben
+            x_val_mm = xr * np.cos(-th) - yr * np.sin(-th) + xo
+            y_val_mm = xr * np.sin(-th) + yr * np.cos(-th) + yo
+            
+            x_local_px = x_val_mm / spacing
+            y_local_px = y_val_mm / spacing
+            
+            x_px = np.zeros_like(x_local_px)
+            y_px = np.zeros_like(y_local_px)
+            
+            # Minden egyes kontúr-pont precíz leképezése a forgatott mátrixon keresztül
+            for i in range(len(x_local_px)):
+                pt = self.roi.mapToItem(self.img_item_dose, pg.Point(float(x_local_px[i]), float(y_local_px[i])))
+                x_px[i] = pt.x()
+                y_px[i] = pt.y()
+                
+            if hasattr(self, 'fit_contour'):
+                self.fit_contour.setData(x_px, y_px)
+        else:
+            self.lbl_fit_amp.setText("<b>Fit Amp:</b> N/A")
+            self.lbl_fit_sigma.setText("<b>Spread:</b> N/A")
+            self.lbl_fit_theta.setText("<b>Tilt (θ):</b> N/A")
+            if hasattr(self, 'fit_contour'):
+                self.fit_contour.setData([], [])
 
         # 6. Konverziós módszer kiolvasása a metaadatokból
         method_str = self.current_meta.get("method", "Standard / Fast")
         if "admm" in str(method_str).lower():
             method_disp = "ADMM (TV Regularized)"
+        elif "hybrid" in str(method_str).lower():
+            method_disp = "Hybrid (Pixel-wise Opt)"
         elif "fast" in str(method_str).lower():
             method_disp = "Fast Vectorized"
         else:
@@ -1559,10 +1598,6 @@ class PrismDosimetryGUI(QMainWindow):
         self.lbl_beam_com.setText(f"<b>CoM:</b> ({com_x_mm:.1f}, {com_y_mm:.1f}) mm")
         self.lbl_beam_fwhm.setText(f"<b>FWHM (X/Y):</b> {fwhm_x} / {fwhm_y} mm")
         self.lbl_roi_area.setText(f"<b>ROI Area:</b> {area_mm2:.1f} mm²")
-
-        self.lbl_fit_amp.setText(f"<b>Fit Amp:</b> {fit_amp:.2f} Gy")
-        self.lbl_fit_sigma.setText(f"<b>Spread:</b> {sig_x:.2f}, {sig_y:.2f} mm")
-        self.lbl_fit_theta.setText(f"<b>Tilt (θ):</b> {theta_deg:.1f}°")
         self.lbl_total_dose.setText(f"<b>Integral Dose:</b> {integral_dose:.1f} Gy·mm²")
 
         self.lbl_dose_stats.setText(f"<b>Mean Dose:</b> {mean_val:.2f} Gy")
@@ -1591,20 +1626,17 @@ class PrismDosimetryGUI(QMainWindow):
         cum_y_norm = cum_y / np.max(cum_y) * 100.0 if np.max(cum_y) > 0 else cum_y
         self.curve_roi_dah.setData(bin_centers, cum_y_norm, pen=self.pen_dah)
 
-        # --- ENSEMBLE (M=50 realizáció) HIBÁS np.clip NÉLKÜL ---
         if hasattr(self, 'current_std_map') and self.current_std_map is not None and valid_std_pixels is not None:
             rng = np.random.default_rng(42)
             n_ens = 50
-            
+            from scipy.ndimage import gaussian_filter
             roi_smooth = gaussian_filter(roi_data, sigma=2.0)
             smooth_valid_pixels = roi_smooth[ellipse_mask]
             
             sys_sigma = np.sqrt(np.maximum(0.0, valid_std_pixels**2 - intrinsic_film_noise**2))
-            
             z_sys = rng.normal(0.0, 1.0, size=(n_ens, 1))
             z_rnd = rng.normal(0.0, 1.0, size=(n_ens, valid_pixels.size))
             
-            # np.maximum használata az alsó küszöbhöz, a felső korlát (None) elhagyásával
             ens_doses = np.maximum(
                 0.0,
                 smooth_valid_pixels[None, :] + z_sys * sys_sigma[None, :] + z_rnd * intrinsic_film_noise
@@ -1698,33 +1730,26 @@ class PrismDosimetryGUI(QMainWindow):
     def _fit_2d_gaussian(self, data, mask, spacing):
         try:
             h, w = data.shape
-            x = np.arange(w) * spacing
-            y = np.arange(h) * spacing
+            x, y = np.arange(w) * spacing, np.arange(h) * spacing
             X, Y = np.meshgrid(x, y)
 
-            data_flat = data.ravel()
-            x_flat, y_flat = X.ravel(), Y.ravel()
-            mask_flat = mask.ravel()
+            fit_x = (X[mask], Y[mask])
+            fit_y = data[mask]
 
-            fit_x = (x_flat[mask_flat], y_flat[mask_flat])
-            fit_y = data_flat[mask_flat]
-
-            # Initial parameters: amp, xo, yo, sigma_x, sigma_y, theta, offset
             amp0 = float(np.max(fit_y))
-            xo0 = float(w * spacing / 2.0)
-            yo0 = float(h * spacing / 2.0)
-            p0 = [amp0, xo0, yo0, xo0 / 3.0, yo0 / 3.0, 0.0, float(np.min(fit_y))]
+            xo0, yo0 = float(w * spacing / 2.0), float(h * spacing / 2.0)
+            # Paraméterek: amp, xo, yo, sigma_x, sigma_y, theta, offset, P (Shape)
+            p0 = [amp0, xo0, yo0, xo0 / 3.0, yo0 / 3.0, 0.0, float(np.min(fit_y)), 1.0]
 
             bounds = (
-                [0, 0, 0, 0.05, 0.05, -np.pi, 0],
-                [amp0 * 2.0, w * spacing, h * spacing, w * spacing, h * spacing, np.pi, amp0]
+                [0, 0, 0, 0.05, 0.05, -np.pi, 0, 0.2],
+                [amp0 * 2.0, w * spacing, h * spacing, w * spacing, h * spacing, np.pi, amp0, 5.0]
             )
 
-            popt, _ = curve_fit(twoD_Gaussian, fit_x, fit_y, p0=p0, bounds=bounds, maxfev=800)
-            amp, xo, yo, sx, sy, th, off = popt
-            return amp, sx, sy, np.degrees(th)
+            popt, _ = curve_fit(twoD_SuperGaussian, fit_x, fit_y, p0=p0, bounds=bounds, maxfev=1500)
+            return popt # [amp, xo, yo, sx, sy, th, off, P]
         except Exception:
-            return 0.0, 0.0, 0.0, 0.0
+            return None
 
 
 if __name__ == "__main__":
