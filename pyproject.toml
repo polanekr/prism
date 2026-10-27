@@ -10,6 +10,7 @@ dependencies = [
     "pyqt6==6.7.1",
     "pyqt6-qt6==6.7.2",
     "pyqtgraph>=0.14.0",
+    "scikit-image>=0.26.0",
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "tifffile>=2026.10.15",

@@ -116,10 +116,13 @@ class BlankRoiDialog(QDialog):
             if roi_data is not None and roi_data.size > 0:
                 if self.raw_img_data.ndim == 3:
                     self.mean_rgb = tuple(np.mean(roi_data, axis=(0, 1)))
+                    self.std_rgb = tuple(np.std(roi_data, axis=(0, 1))) # <-- ÚJ SOR
                     self.stats_lbl.setText(f"<b>Mean RGB:</b> R={self.mean_rgb[0]:.2f}, G={self.mean_rgb[1]:.2f}, B={self.mean_rgb[2]:.2f}")
                 else:
                     m_val = float(np.mean(roi_data))
+                    s_val = float(np.std(roi_data)) # <-- ÚJ SOR
                     self.mean_rgb = (m_val, m_val, m_val)
+                    self.std_rgb = (s_val, s_val, s_val) # <-- ÚJ SOR
                     self.stats_lbl.setText(f"<b>Mean Value:</b> {m_val:.2f} (Grayscale)")
         except Exception as e:
             self.stats_lbl.setText(f"<b>Error calculating stats:</b> {e}")
@@ -166,7 +169,10 @@ class EngineWorker(QThread):
                 self.finished.emit(f"Successfully converted {len(files)} film(s) to dose maps!")
                 
         except Exception as e:
-            self.error.emit(str(e))
+            import traceback
+            tb_str = traceback.format_exc()
+            print(tb_str)
+            self.error.emit(f"{e}\n\n{tb_str}")
 
 
 # =============================================================================
@@ -191,6 +197,7 @@ class PrismDosimetryGUI(QMainWindow):
         self.current_meta = {}
         self.current_film_name = "dose_map"
         self.global_blank_rgb = None
+        self.global_blank_std = None
         self.isocurves = []
         self.is_white_mode = False
 
@@ -304,7 +311,9 @@ class PrismDosimetryGUI(QMainWindow):
 
         conv_layout.addWidget(QLabel("Solver method:"))
         self.combo_solver = QComboBox()
-        self.combo_solver.addItems(["fast (Vectorized, fast)", "hybrid (Pixel-wise optimization)"])
+        self.combo_solver.addItems(["mayer (Closed-form Bayesian 3-ch, 0-50 Gy)",
+            "fast (Vectorized 2-ch, fast)", 
+            "admm (Total Variation + L2 Thickness Optimization)"])
         self.chk_conv_clean = QCheckBox("Apply bFDR artifact removal")
         conv_layout.addWidget(self.combo_solver)
         conv_layout.addWidget(self.chk_conv_clean)
@@ -604,6 +613,13 @@ class PrismDosimetryGUI(QMainWindow):
             brush=(0, 120, 220, 90), pen=self.pen_hist
         )
         self.curve_roi_dah = self.plot_roi_hist.plot(pen=self.pen_dah)
+
+        self.curve_dah_low = pg.PlotCurveItem(pen=pg.mkPen(None))
+        self.curve_dah_high = pg.PlotCurveItem(pen=pg.mkPen(None))
+        self.fill_dah_ci = pg.FillBetweenItem(
+            self.curve_dah_low, self.curve_dah_high, brush=pg.mkBrush(255, 50, 50, 65)
+        )
+        self.plot_roi_hist.addItem(self.fill_dah_ci)
         
         bottom_layout.addWidget(self.plot_roi_hist, stretch=2)
         comp_layout.addWidget(bottom_panel, stretch=1)
@@ -876,6 +892,7 @@ class PrismDosimetryGUI(QMainWindow):
         
         if dialog.exec_() == QDialog.Accepted and dialog.mean_rgb is not None:
             self.global_blank_rgb = dialog.mean_rgb
+            self.global_blank_std = dialog.std_rgb
             QMessageBox.information(
                 self, "Success", 
                 f"Blank reference ROI stored globally!\n"
@@ -1111,7 +1128,13 @@ class PrismDosimetryGUI(QMainWindow):
             return
 
         file_paths = [str(self.raw_dir / name) for name in items]
-        method = 'hybrid' if "hybrid" in self.combo_solver.currentText() else 'fast'
+        solver_txt = self.combo_solver.currentText().lower()
+        if "mayer" in solver_txt:
+            method = 'mayer'
+        elif "admm" in solver_txt:
+            method = 'admm'
+        else:
+            method = 'fast'
         cleaning = self.chk_conv_clean.isChecked()
 
         self.engine.output_folder = str(self.processed_dir)
@@ -1416,6 +1439,7 @@ class PrismDosimetryGUI(QMainWindow):
     def update_roi_stats(self):
         if not hasattr(self, 'roi') or not hasattr(self, 'line_roi'): return
         if self.current_dose_map is None: return
+        
         roi_data = self.roi.getArrayRegion(self.current_dose_map, self.img_item_dose)
         if roi_data is None or roi_data.size == 0: return
 
@@ -1442,28 +1466,50 @@ class PrismDosimetryGUI(QMainWindow):
         area_mm2 = num_px * (spacing ** 2)
         integral_dose = float(np.sum(valid_pixels) * (spacing ** 2))
 
-        # Térbeli dózisszórás (százalékban a fantomon belüli homogenitásra)
-        spatial_cov_pct = (std_val / mean_val * 100.0) if mean_val > 0 else 0.0
+        # --- DINAMIKUS ZAJBECSLÉS A BLANK ROI ALAPJÁN (Hibatűrő blokk) ---
+        intrinsic_film_noise = mean_val * 0.010  # Biztonsági fallback
+        try:
+            if hasattr(self, 'global_blank_std') and self.global_blank_std is not None and self.global_blank_rgb is not None and self.engine and self.engine.calib_params:
+                blank_mean = np.array(self.global_blank_rgb, dtype=float)
+                blank_std = np.array(self.global_blank_std, dtype=float)
+                sigma_od_base = blank_std / (np.log(10) * np.maximum(blank_mean, 1.0))
+                
+                ch = 'G' if mean_val > 8.0 else 'R'
+                ch_idx = 1 if ch == 'G' else 0
+                
+                current_od = self.engine.rational_func_od(mean_val, *self.engine.calib_params[ch])
+                d_plus = self.engine.inv_rational_func_dose(current_od + sigma_od_base[ch_idx], self.engine.calib_params[ch])
+                d_minus = self.engine.inv_rational_func_dose(current_od - sigma_od_base[ch_idx], self.engine.calib_params[ch])
+                
+                noise_calc = float(np.abs(d_plus - d_minus) / 2.0)
+                intrinsic_film_noise = max(noise_calc, mean_val * 0.005)
+        except Exception as e:
+            print(f"Warning: Blank ROI noise calculation skipped, using fallback. ({e})")
 
-        # --- ÚJ: 1/B. Modell Bizonytalanság kinyerése (_std.npy) ugyanazzal a maszkkal ---
+        # Dekonvolvált (valódi) nyaláb-szórás:
+        true_beam_std = np.sqrt(max(0.0, std_val**2 - intrinsic_film_noise**2))
+        spatial_cov_pct = (std_val / mean_val * 100.0) if mean_val > 0 else 0.0
+        true_beam_cov_pct = (true_beam_std / mean_val * 100.0) if mean_val > 0 else 0.0
+        # ----------------------------------------------------------------
+
+        # --- 1/B. Modell Bizonytalanság kinyerése (_std.npy) ugyanazzal a maszkkal ---
         if hasattr(self, 'current_std_map') and self.current_std_map is not None:
             roi_std_data = self.roi.getArrayRegion(self.current_std_map, self.img_item_dose)
             if roi_std_data is not None and roi_std_data.shape == roi_data.shape:
                 valid_std_pixels = roi_std_data[ellipse_mask]
                 mean_uncert = float(np.mean(valid_std_pixels))
-                # Dózissal súlyozott relatív bizonytalanság (hogy a háttérzaj ne torzítsa a %-ot)
                 active_px = valid_pixels > (0.2 * max_val)
                 if np.any(active_px):
                     rel_uncert = float(np.mean(valid_std_pixels[active_px] / valid_pixels[active_px]) * 100.0)
                 else:
                     rel_uncert = (mean_uncert / mean_val * 100.0) if mean_val > 0 else 0.0
             else:
-                mean_uncert, rel_uncert = None, None
+                valid_std_pixels, mean_uncert, rel_uncert = None, None, None
+        else:
+            valid_std_pixels, mean_uncert, rel_uncert = None, None, None
 
         # 2. Orvosfizikai lefedettség: D90% és V95%
-        # D90%: A dózis, amit a pixelek 90%-a meghalad (10. percentilis)
         d90_val = float(np.percentile(valid_pixels, 10))
-        # V95%: A maximális dózis 95%-át elérő pixelek aránya [%]
         v95_count = np.sum(valid_pixels >= 0.95 * max_val)
         v95_val = float((v95_count / num_px) * 100.0) if num_px > 0 else 0.0
 
@@ -1481,7 +1527,6 @@ class PrismDosimetryGUI(QMainWindow):
             com_x_mm = (pos.x() + com_x) * spacing
             com_y_mm = (pos.y() + com_y) * spacing
             
-            # Spatial STD (Térbeli kiterjedés / szórás mm-ben)
             var_x = np.sum(((x_indices - com_x) ** 2) * masked_d) / tot_mass
             var_y = np.sum(((y_indices - com_y) ** 2) * masked_d) / tot_mass
             spatial_std_mm = np.sqrt(var_x + var_y) * spacing
@@ -1502,8 +1547,8 @@ class PrismDosimetryGUI(QMainWindow):
 
         # 6. Konverziós módszer kiolvasása a metaadatokból
         method_str = self.current_meta.get("method", "Standard / Fast")
-        if "hybrid" in str(method_str).lower():
-            method_disp = "Hybrid (Pixel-wise Opt)"
+        if "admm" in str(method_str).lower():
+            method_disp = "ADMM (TV Regularized)"
         elif "fast" in str(method_str).lower():
             method_disp = "Fast Vectorized"
         else:
@@ -1521,7 +1566,7 @@ class PrismDosimetryGUI(QMainWindow):
         self.lbl_total_dose.setText(f"<b>Integral Dose:</b> {integral_dose:.1f} Gy·mm²")
 
         self.lbl_dose_stats.setText(f"<b>Mean Dose:</b> {mean_val:.2f} Gy")
-        self.lbl_dose_std.setText(f"<b>Spatial STD:</b> ±{std_val:.2f} Gy ({spatial_cov_pct:.1f}%)")
+        self.lbl_dose_std.setText(f"<b>Spatial STD:</b> ±{std_val:.2f} Gy ({spatial_cov_pct:.1f}%) [Beam: {true_beam_cov_pct:.1f}%]")
         self.lbl_dose_minmax.setText(f"<b>Min / Max:</b> {min_val:.2f} / {max_val:.2f} Gy")
         self.lbl_d90_val.setText(f"<b>D90%:</b> {d90_val:.2f} Gy | <b>V95%:</b> {v95_val:.1f}%")
 
@@ -1530,14 +1575,13 @@ class PrismDosimetryGUI(QMainWindow):
         self.lbl_symmetry.setText(f"<b>Symmetry:</b> {symmetry_pct}")
         self.lbl_conv_method.setText(f"<b>Method:</b> {method_disp}")
 
-        # --- ÚJ: Bizonytalanság (Uncertainty) címke frissítése ---
         if hasattr(self, 'lbl_roi_uncert'):
             if mean_uncert is not None:
                 self.lbl_roi_uncert.setText(f"<b>Model Uncertainty:</b> ±{mean_uncert:.3f} Gy ({rel_uncert:.1f}%)")
             else:
                 self.lbl_roi_uncert.setText("<b>Model Uncertainty:</b> N/A (Nincs _std.npy)")
 
-        # 7. Hisztogram és DAH diagram frissítése
+        # 7. Hisztogram és Ensemble-alapú DAH (DVH) konfidenciasáv
         y, x = np.histogram(valid_pixels, bins=50)
         bin_centers = (x[:-1] + x[1:]) / 2
         y_norm = y / np.max(y) * 100.0 if np.max(y) > 0 else y
@@ -1546,6 +1590,43 @@ class PrismDosimetryGUI(QMainWindow):
         cum_y = np.cumsum(y[::-1])[::-1]
         cum_y_norm = cum_y / np.max(cum_y) * 100.0 if np.max(cum_y) > 0 else cum_y
         self.curve_roi_dah.setData(bin_centers, cum_y_norm, pen=self.pen_dah)
+
+        # --- ENSEMBLE (M=50 realizáció) HIBÁS np.clip NÉLKÜL ---
+        if hasattr(self, 'current_std_map') and self.current_std_map is not None and valid_std_pixels is not None:
+            rng = np.random.default_rng(42)
+            n_ens = 50
+            
+            roi_smooth = gaussian_filter(roi_data, sigma=2.0)
+            smooth_valid_pixels = roi_smooth[ellipse_mask]
+            
+            sys_sigma = np.sqrt(np.maximum(0.0, valid_std_pixels**2 - intrinsic_film_noise**2))
+            
+            z_sys = rng.normal(0.0, 1.0, size=(n_ens, 1))
+            z_rnd = rng.normal(0.0, 1.0, size=(n_ens, valid_pixels.size))
+            
+            # np.maximum használata az alsó küszöbhöz, a felső korlát (None) elhagyásával
+            ens_doses = np.maximum(
+                0.0,
+                smooth_valid_pixels[None, :] + z_sys * sys_sigma[None, :] + z_rnd * intrinsic_film_noise
+            )
+            
+            d90_ens = np.percentile(ens_doses, 10, axis=1)
+            d90_err = (np.percentile(d90_ens, 84) - np.percentile(d90_ens, 16)) / 2.0
+            self.lbl_d90_val.setText(f"<b>D90%:</b> {d90_val:.2f} ± {d90_err:.2f} Gy | <b>V95%:</b> {v95_val:.1f}%")
+
+            dah_curves = np.zeros((n_ens, len(bin_centers)))
+            for m in range(n_ens):
+                ym, _ = np.histogram(ens_doses[m], bins=x)
+                c_ym = np.cumsum(ym[::-1])[::-1]
+                dah_curves[m] = c_ym / np.max(c_ym) * 100.0 if np.max(c_ym) > 0 else c_ym
+                
+            dah_low = np.percentile(dah_curves, 5, axis=0)
+            dah_high = np.percentile(dah_curves, 95, axis=0)
+            self.curve_dah_low.setData(bin_centers, dah_low)
+            self.curve_dah_high.setData(bin_centers, dah_high)
+        else:
+            self.curve_dah_low.setData([], [])
+            self.curve_dah_high.setData([], [])
 
     def _calc_penumbra(self, prof_x, prof_y, spacing):
         """Kiszámolja a 80%-20% orvosfizikai penumbrát az átlagolt profilokból."""
