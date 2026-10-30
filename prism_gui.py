@@ -26,6 +26,7 @@ os.environ["PYQTGRAPH_QT_LIB"] = "PyQt5"
 import pyqtgraph as pg
 
 from dosimetry import GafchromicEngine, BAYES_AVAILABLE
+from bio_dosimetry import BioDosimetryTab
 pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
 
 # =============================================================================
@@ -233,6 +234,8 @@ class PrismDosimetryGUI(QMainWindow):
         
         self.viewer_tab = self._create_viewer_tab()
         self.tabs.addTab(self.viewer_tab, "🔬 LWFA Beam Analysis & Profiles")
+        self.bio_tab = BioDosimetryTab()
+        self.tabs.addTab(self.bio_tab, "🧬 Radiobiology & 3D Sample Dosimetry")
         self.tabs.addTab(self._create_placeholder_tab("Magnetic Spectrometer & Dispersion", "WIP"), "⚡ Spectrometer (WIP)")
         self.tabs.addTab(self._create_placeholder_tab("RCF Stack & Depth-Dose Bragg Curve", "WIP"), "🧱 RCF Stack Analyzer (WIP)")
         
