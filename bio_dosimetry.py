@@ -497,59 +497,56 @@ class BioDosimetryTab(QWidget):
             QMessageBox.warning(self, "Error", "Add at least one ROI!")
             return
 
-        # 1. Numerikus transzformáció a Front filmen és a hozzá tartozó bizonytalansági térképen
+        # 1. Regisztráció (Forgatás a kép közepe körül, majd eltolás)
         dx = self.sl_shift_x.value()
         dy = self.sl_shift_y.value()
         rot_deg = self.sl_rot.value() / 10.0
         
-        front_aligned = rotate(self.front_dose, -rot_deg, reshape=False, order=1, mode='nearest')
-        front_aligned = shift(front_aligned, [dy, dx], order=1, mode='nearest')
-        
         h, w = self.back_dose.shape
-        front_aligned = front_aligned[:h, :w]
-        if front_aligned.shape != self.back_dose.shape:
-            temp = np.zeros_like(self.back_dose)
-            mh, mw = front_aligned.shape
-            temp[:mh, :mw] = front_aligned
-            front_aligned = temp
-
-        # Front STD térkép igazítása vagy fallback
+        cy, cx = h / 2.0, w / 2.0
+        
+        from scipy.ndimage import affine_transform
+        theta = np.radians(-rot_deg)
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        
+        transform_matrix = np.array([
+            [cos_t, -sin_t],
+            [sin_t,  cos_t]
+        ])
+        
+        offset_y = cy - (cy * cos_t - cx * sin_t) - dy
+        offset_x = cx - (cy * sin_t + cx * cos_t) - dx
+        
+        front_aligned = affine_transform(self.front_dose, transform_matrix, offset=(offset_y, offset_x), order=1, mode='nearest')[:h, :w]
+        
         if self.front_std is not None:
-            front_std_aligned = rotate(self.front_std, -rot_deg, reshape=False, order=1, mode='nearest')
-            front_std_aligned = shift(front_std_aligned, [dy, dx], order=1, mode='nearest')[:h, :w]
-            if front_std_aligned.shape != self.back_dose.shape:
-                temp_s = np.zeros_like(self.back_dose)
-                temp_s[:front_std_aligned.shape[0], :front_std_aligned.shape[1]] = front_std_aligned
-                front_std_aligned = temp_s
+            front_std_aligned = affine_transform(self.front_std, transform_matrix, offset=(offset_y, offset_x), order=1, mode='nearest')[:h, :w]
         else:
             front_std_aligned = front_aligned * 0.02
 
         back_std_map = self.back_std if self.back_std is not None else self.back_dose * 0.02
-
-        # 2. Exponenciális PDD interpoláció és szóródás-modell
         w_back, scatter_sigma_mm = self.geometry.get_weights_and_scattering()
         
         d_front_safe = np.clip(front_aligned, 1e-4, None)
         d_back_safe = np.clip(self.back_dose, 1e-4, None)
-        
         d_sample_map = (d_front_safe ** (1.0 - w_back)) * (d_back_safe ** w_back)
         
-        # Analitikus hibapropagáció
         term_f = ((1.0 - w_back) * (d_sample_map / d_front_safe) * front_std_aligned) ** 2
         term_b = (w_back * (d_sample_map / d_back_safe) * back_std_map) ** 2
         sigma_sample_map = np.sqrt(term_f + term_b)
 
+        from scipy.ndimage import gaussian_filter
         if scatter_sigma_mm > 0:
             sigma_px = scatter_sigma_mm / self.spacing
             d_sample_map = gaussian_filter(d_sample_map, sigma=sigma_px)
             sigma_sample_map = gaussian_filter(sigma_sample_map, sigma=sigma_px)
 
-        # 3. Kinyerés és statisztikák ROI-nként
+        # Táblázat és adatok alaphelyzetbe állítása
         self.table.setRowCount(0)
         self.results_data.clear()
         
         from matplotlib.path import Path as MplPath
-
+        
         for i, roi in enumerate(self.rois):
             roi_id = i + 1
             roi_data = roi.getArrayRegion(d_sample_map, self.img_back)
@@ -558,56 +555,77 @@ class BioDosimetryTab(QWidget):
                 continue
 
             rh, rw = roi_data.shape
+            y_idx, x_idx = np.indices((rh, rw))
+            w_vol = np.ones_like(roi_data) 
             
-            # Maszkolás típus szerint
+            # Maszk és 3D súlyozás generálása
             if isinstance(roi, EppendorfROI):
                 mask = roi.get_mask((rh, rw))
+                dims = {"0.5 ml": (5.5, 6.0, 3.5), "1.5 ml": (8.8, 8.0, 5.0), "2.0 ml": (9.2, 9.0, 4.5)}
+                w_mm, h_mm, cone_h_mm = dims.get(roi.tube_type, (8.8, 8.0, 5.0))
+                r_max_px = (w_mm / 2.0) / self.spacing
+                cone_h_px = cone_h_mm / self.spacing
+                
+                cone_start_y = rh - cone_h_px
+                r_y = np.where(
+                    y_idx < cone_start_y,
+                    r_max_px,
+                    np.maximum(0.1, r_max_px * (1.0 - (y_idx - cone_start_y) / cone_h_px))
+                )
+                
+                x_0 = rw / 2.0
+                rad_diff = np.maximum(0.0, r_y**2 - (x_idx - x_0)**2)
+                w_vol = 2.0 * np.sqrt(rad_diff)
+                
             elif isinstance(roi, pg.EllipseROI):
-                yy, xx = np.ogrid[:rh, :rw]
-                mask = ((yy - rh / 2.0)**2 / (rh / 2.0)**2 + (xx - rw / 2.0)**2 / (rw / 2.0)**2) <= 1.0
+                mask = ((y_idx - rh / 2.0)**2 / (rh / 2.0)**2 + (x_idx - rw / 2.0)**2 / (rw / 2.0)**2) <= 1.0
             else:
                 handles = roi.getHandles()
                 h_coords = [roi.mapToParent(h.pos()) for h in handles]
                 bounding_pos = roi.mapToParent(pg.Point(0, 0))
                 poly_local = [[p.x() - bounding_pos.x(), p.y() - bounding_pos.y()] for p in h_coords]
-                y_idx, x_idx = np.indices((rh, rw))
                 pix_coords = np.vstack([x_idx.ravel(), y_idx.ravel()]).T
                 poly_path = MplPath(poly_local)
                 mask = poly_path.contains_points(pix_coords).reshape((rh, rw))
 
             valid_pixels = roi_data[mask]
             valid_sigmas = roi_sigma[mask]
+            valid_weights = w_vol[mask]
             
-            # Nullák és peremhibák szűrése a reális minimumhoz
             active_mask = valid_pixels > 0.001
             active_pixels = valid_pixels[active_mask]
             active_sigmas = valid_sigmas[active_mask]
+            active_weights = valid_weights[active_mask]
             
             if active_pixels.size == 0:
                 continue
+                
+            # Súlyozott átlag, szórás és DVH kiszámítása
+            w_sum = np.sum(active_weights)
+            mean_d = float(np.sum(active_pixels * active_weights) / w_sum) if w_sum > 0 else 0.0
+            variance_d = float(np.sum(active_weights * (active_pixels - mean_d)**2) / w_sum) if w_sum > 0 else 0.0
+            spread_d = np.sqrt(variance_d)
+            mean_uncert = float(np.sum(active_sigmas * active_weights) / w_sum) if w_sum > 0 else 0.0
             
-            mean_d = float(np.mean(active_pixels))
-            spread_d = float(np.std(active_pixels))
-            mean_uncert = float(np.mean(active_sigmas))
             min_d = float(np.min(active_pixels))
             max_d = float(np.max(active_pixels))
             
             spread_pct = (spread_d / mean_d * 100.0) if mean_d > 0 else 0.0
             uncert_pct = float(np.mean(active_sigmas / active_pixels) * 100.0)
             
-            # dDVH hisztogramképzés (biology.py struktúrához)
-            y, x = np.histogram(active_pixels, bins=50)
-            y_norm = (y / np.max(y) * 100.0) if np.max(y) > 0 else y.astype(float)
-            bin_centers = (x[:-1] + x[1:]) / 2.0
+            y_raw, x_edges = np.histogram(active_pixels, bins=50, weights=active_weights)
+            y_norm = (y_raw / np.max(y_raw) * 100.0) if np.max(y_raw) > 0 else y_raw
+            bin_centers = (x_edges[:-1] + x_edges[1:]) / 2.0
             bin_stds = np.full_like(bin_centers, mean_uncert)
             dose_stats_matrix = np.vstack([bin_centers, bin_stds])
 
+            # Adatok mentése
             self.results_data[roi_id] = {
                 'hist_x': bin_centers,
-                'hist_edges': x,
+                'hist_edges': x_edges,
                 'hist_y': y_norm,
                 'dose_stats': dose_stats_matrix,
-                'weights': y_norm,
+                'weights': active_weights,
                 'raw_voxels': active_pixels,
                 'raw_sigmas': active_sigmas,
                 'mean_dose': mean_d,
@@ -618,6 +636,7 @@ class BioDosimetryTab(QWidget):
                 'z_weight_back': w_back
             }
             
+            # Táblázat UI frissítése
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(f"Sample #{roi_id}"))
@@ -690,10 +709,9 @@ class BioDosimetryTab(QWidget):
                 for roi_id, data in self.results_data.items():
                     writer.writerow([f"--- SAMPLE #{roi_id} ---"])
                     writer.writerow(["Dose Bin [Gy]", "Relative Volume [%]"])
-                    x = data['hist_x']
+                    x_centers = data['hist_x']
                     y = data['hist_y']
-                    bin_centers = (x[:-1] + x[1:]) / 2
-                    for d, vol in zip(bin_centers, y):
+                    for d, vol in zip(x_centers, y):
                         writer.writerow([f"{d:.3f}", f"{vol:.1f}"])
                     writer.writerow([])
             QMessageBox.information(self, "Exported", f"Data saved to {path}")

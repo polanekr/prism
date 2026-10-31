@@ -77,9 +77,13 @@ class GafchromicEngine:
     # 0. CORE MATHEMATICS (OD CALCULATION & DERIVATIVES)
     # =========================================================================
 
-    def _calculate_od_map(self, img: np.ndarray, blank_img: np.ndarray) -> np.ndarray:
+    def _calculate_od_map(self, img: np.ndarray, blank_img: np.ndarray, 
+                          pixel_spacing_mm: float = 0.0846, 
+                          x_offset_mm: float = None, 
+                          scanner_center_mm: float = 108.0) -> np.ndarray:
         """
-        Calculates the Optical Density (OD) map: OD = log10(Blank / Film)
+        Calculates the Optical Density (OD) map with absolute position-aware,
+        OD- and channel-dependent Lateral Response Artifact (LRA) correction.
         """
         img_safe = np.where(img <= 0, 1e-6, img)
         blank_safe = np.where(blank_img <= 0, 1e-6, blank_img)
@@ -89,7 +93,26 @@ class GafchromicEngine:
             
         od_map = np.nan_to_num(od_map, nan=0.0, posinf=0.0, neginf=0.0)
         od_map[od_map < 0] = 0.0
-        return od_map
+
+        # --- FIZIKAI LRA KORREKCIÓ ---
+        h, w = od_map.shape[:2]
+        x_px = np.arange(w)
+        
+        if x_offset_mm is not None:
+            # Abszolút pozíció a szkenner üveglapján (ha a scan.py-ból jött a fájl)
+            absolute_x_mm = x_offset_mm + (x_px * pixel_spacing_mm)
+            dist_from_center_mm = absolute_x_mm - scanner_center_mm
+        else:
+            # Fallback: feltételezzük, hogy a film a szkenner középvonalára lett helyezve
+            dist_from_center_mm = (x_px - w / 2.0) * pixel_spacing_mm
+            
+        # Csatornafüggő LRA együtthatók Epson szkennerhez (EBT3 film)
+        k_coeffs = np.array([1.2e-5, 0.5e-5, 0.1e-5]) 
+        
+        lra_penalty = k_coeffs[None, :] * (dist_from_center_mm[:, None] ** 2)
+        od_map_corr = od_map * (1.0 - lra_penalty[None, :, :] * od_map)
+        
+        return np.maximum(od_map_corr, 0.0)
 
     def _estimate_od_noise_map(self, raw_od_map: np.ndarray, filtered_od_map: np.ndarray) -> np.ndarray:
         """
@@ -321,7 +344,7 @@ class GafchromicEngine:
             od_map = self._calculate_od_map(img, blank_img)
             
             if use_cleaning:
-                od_map = self._clean_od_map_bfdr(od_map)
+                od_map = self._clean_od_map_biharmonic(od_map)
             
             means_od, _ = self._get_roi_stats(od_map, size=roi_size)
             for i, ch in enumerate(['R', 'G', 'B']):
@@ -482,15 +505,22 @@ class GafchromicEngine:
     # =========================================================================
     
     def _load_tiff_with_meta(self, path: str):
-        """Loads TIFF and extracts DPI/Resolution metadata."""
+        """Loads TIFF and extracts DPI/Resolution and absolute scanner position metadata."""
         img = tifffile.imread(path).astype(np.float64)
         if img.ndim == 3 and img.shape[2] == 4:
             img = img[:, :, :3]
 
-        meta = {'pixel_spacing_mm': 0.0846} # Default 300 DPI
+        # Alapértelmezett értékek (fallback)
+        meta = {
+            'pixel_spacing_mm': 0.0846, 
+            'x_offset_mm': None, 
+            'scanner_center_mm': 108.0
+        } 
         try:
             with tifffile.TiffFile(path) as tif:
                 tags = tif.pages[0].tags
+                
+                # Felbontás (DPI) kiolvasása
                 if 'XResolution' in tags:
                     x_res = tags['XResolution'].value
                     dpi = x_res[0] / x_res[1] if isinstance(x_res, tuple) else float(x_res)
@@ -498,6 +528,16 @@ class GafchromicEngine:
                     unit = tags['ResolutionUnit'].value if 'ResolutionUnit' in tags else 2
                     if unit == 2: meta['pixel_spacing_mm'] = 25.4 / dpi
                     elif unit == 3: meta['pixel_spacing_mm'] = 10.0 / dpi
+                    
+                # Pozíció (LRA korrekcióhoz) kiolvasása az ImageDescription tag-ből
+                if 'ImageDescription' in tags:
+                    desc = tags['ImageDescription'].value
+                    if isinstance(desc, str):
+                        for part in desc.split(';'):
+                            if '=' in part:
+                                key, val = part.split('=')
+                                if key == 'left_mm': meta['x_offset_mm'] = float(val)
+                                if key == 'scanner_center_mm': meta['scanner_center_mm'] = float(val)
         except Exception: pass
         return img, meta
 
@@ -577,9 +617,12 @@ class GafchromicEngine:
                 else:
                     current_blank = blank_img
             
-            # Nyers és szűrt OD térkép a lokális scanner-zaj becsléséhez
-            raw_od_map = self._calculate_od_map(img_raw, current_blank)
-            od_map = self._calculate_od_map(img, current_blank)
+            spacing = meta.get("pixel_spacing_mm", 0.0846)
+            x_offset = meta.get("x_offset_mm", None)
+            scanner_center = meta.get("scanner_center_mm", 108.0)
+            # Nyers és szűrt OD térkép a lokális scanner-zaj becsléséhez (LRA korrekcióval)
+            raw_od_map = self._calculate_od_map(img_raw, current_blank, spacing, x_offset, scanner_center)
+            od_map = self._calculate_od_map(img, current_blank, spacing, x_offset, scanner_center)
             
             if use_cleaning:
                 od_map = self._clean_od_map_biharmonic(od_map)

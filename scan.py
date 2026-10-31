@@ -2,176 +2,40 @@ import os
 import sys
 import subprocess
 import re
-import threading
 import datetime
 import tempfile
 import platform
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import tifffile
 
-class FilmScannerApp(tk.Tk):
-    def __init__(self, target_directory=None):
+from PyQt5.QtWidgets import (
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLabel, QLineEdit, QComboBox, QCheckBox, QGroupBox,
+    QFileDialog, QSpinBox, QDoubleSpinBox, QTextEdit, QMessageBox, QListWidget
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+
+class ScanWorker(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, task, **kwargs):
         super().__init__()
-        self.title("PRISM - Radiochromic Film Scanner (EBT3)")
-        self.geometry("720x820")
-        
-        # Operációs rendszer detektálása (Windows = NAPS2, Linux = SANE)
+        self.task = task
+        self.kwargs = kwargs
         self.is_windows = platform.system() == "Windows"
 
-        self.scanned_files = []
-        self.scan_counter = 0
+    def run(self):
+        if self.task == "find_scanners":
+            self._find_scanners()
+        elif self.task == "warmup":
+            self._run_warmup()
+        elif self.task == "scan":
+            self._run_scan()
 
-        if target_directory and os.path.isdir(target_directory):
-            initial_dir = os.path.abspath(target_directory)
-        else:
-            initial_dir = os.path.expanduser("~")
-
-        main_frame = ttk.Frame(self, padding="15")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # --- 1. SZKENNEREK LISTÁJA ---
-        ttk.Label(main_frame, text=f"Available Scanners ({'NAPS2 / WIA' if self.is_windows else 'SANE'}):").pack(anchor=tk.W)
-        self.scanner_list = tk.Listbox(main_frame, height=3, exportselection=False)
-        self.scanner_list.pack(fill=tk.X, pady=(0, 5))
-        
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(0, 15))
-        self.refresh_btn = ttk.Button(btn_frame, text="🔄 Refresh Scanners", command=self.find_scanners)
-        self.refresh_btn.pack(side=tk.LEFT, padx=(0, 10))
-        self.warmup_btn = ttk.Button(btn_frame, text="🔥 Fast Warm-up (3x Blank)", command=self.start_warmup)
-        self.warmup_btn.pack(side=tk.LEFT)
-
-        # --- 2. MENTÉS HELYE ---
-        dir_frame = ttk.LabelFrame(main_frame, text="Save Destination (Target Directory)", padding="8")
-        dir_frame.pack(fill=tk.X, pady=(0, 10))
-        self.dir_var = tk.StringVar(value=initial_dir)
-        ttk.Entry(dir_frame, textvariable=self.dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Button(dir_frame, text="Browse...", command=self.browse_directory).pack(side=tk.LEFT)
-
-        # --- 3. FÁJLNÉV BEÁLLÍTÁSOK ---
-        name_frame = ttk.LabelFrame(main_frame, text="Filename & Sequence Settings", padding="8")
-        name_frame.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(name_frame, text="Prefix:").grid(row=0, column=0, padx=5, sticky=tk.W)
-        self.base_name_var = tk.StringVar(value="film")
-        ttk.Entry(name_frame, textvariable=self.base_name_var, width=15).grid(row=0, column=1, padx=5, sticky=tk.W)
-        self.add_date_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(name_frame, text="Append Date", variable=self.add_date_var).grid(row=0, column=2, padx=15, sticky=tk.W)
-        ttk.Button(name_frame, text="Reset Index", command=self.reset_counter).grid(row=0, column=3, padx=5, sticky=tk.E)
-
-        # --- 4. SZKENNELÉSI TERÜLET ---
-        area_frame = ttk.LabelFrame(main_frame, text="Scan Area & Geometry", padding="8")
-        area_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(area_frame, text="Preset Profile:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.profile_var = tk.StringVar()
-        self.profiles = {
-            "Standard Film (50.4 x 48.4 mm)": (136.0, 122.0, 50.4, 48.4),
-            "Calibration Strip (30 x 150 mm)": (120.0, 50.0, 30.0, 150.0),
-            "Full Bed Area": None,
-            "Custom Region": None
-        }
-        self.profile_combo = ttk.Combobox(area_frame, textvariable=self.profile_var, values=list(self.profiles.keys()), state="readonly")
-        self.profile_combo.grid(row=0, column=1, columnspan=3, padx=5, pady=5, sticky=tk.W)
-        self.profile_combo.set("Standard Film (50.4 x 48.4 mm)")
-        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_change)
-
-        self.left_var, self.top_var = tk.DoubleVar(), tk.DoubleVar()
-        self.width_var, self.height_var = tk.DoubleVar(), tk.DoubleVar()
-
-        ttk.Label(area_frame, text="Left (mm):").grid(row=1, column=0, padx=5, pady=2, sticky=tk.E)
-        self.left_spin = ttk.Spinbox(area_frame, from_=0.0, to=500.0, increment=0.1, textvariable=self.left_var, width=8)
-        self.left_spin.grid(row=1, column=1, padx=5, pady=2)
-        ttk.Label(area_frame, text="Top (mm):").grid(row=1, column=2, padx=5, pady=2, sticky=tk.E)
-        self.top_spin = ttk.Spinbox(area_frame, from_=0.0, to=500.0, increment=0.1, textvariable=self.top_var, width=8)
-        self.top_spin.grid(row=1, column=3, padx=5, pady=2)
-        ttk.Label(area_frame, text="Width (mm):").grid(row=2, column=0, padx=5, pady=2, sticky=tk.E)
-        self.width_spin = ttk.Spinbox(area_frame, from_=0.0, to=500.0, increment=0.1, textvariable=self.width_var, width=8)
-        self.width_spin.grid(row=2, column=1, padx=5, pady=2)
-        ttk.Label(area_frame, text="Height (mm):").grid(row=2, column=2, padx=5, pady=2, sticky=tk.E)
-        self.height_spin = ttk.Spinbox(area_frame, from_=0.0, to=500.0, increment=0.1, textvariable=self.height_var, width=8)
-        self.height_spin.grid(row=2, column=3, padx=5, pady=2)
-
-        # --- 5. ORVOSFIZIKAI BEÁLLÍTÁSOK (LRA & ÁTLAGOLÁS) ---
-        physics_frame = ttk.LabelFrame(main_frame, text="Advanced Scanning (Noise Reduction & LRA)", padding="8")
-        physics_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(physics_frame, text="Scans to Average:").grid(row=0, column=0, padx=5, sticky=tk.W)
-        self.num_scans_var = tk.IntVar(value=3)
-        ttk.Spinbox(physics_frame, from_=1, to=5, textvariable=self.num_scans_var, width=5).grid(row=0, column=1, padx=5, sticky=tk.W)
-        
-        ttk.Label(physics_frame, text="DPI:").grid(row=0, column=2, padx=(15,5), sticky=tk.W)
-        self.res_var = tk.StringVar(value="300")
-        ttk.Combobox(physics_frame, textvariable=self.res_var, values=["75", "150", "300", "600"], width=6, state="readonly").grid(row=0, column=3, padx=5, sticky=tk.W)
-
-        self.lra_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(physics_frame, text="Apply LRA (Lateral Response Artifact) Correction", variable=self.lra_var).grid(row=1, column=0, columnspan=4, pady=(5,0), padx=5, sticky=tk.W)
-
-        self.raw_mode_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(physics_frame, text="Force RAW Mode (No Color Correction)", variable=self.raw_mode_var).grid(row=2, column=0, columnspan=4, pady=(2,0), padx=5, sticky=tk.W)
-
-        # --- 6. FUTTATÁS ÉS LOG ---
-        self.scan_btn = ttk.Button(main_frame, text="▶ Start Acquisition (Scan & Average)", command=self.start_scan)
-        self.scan_btn.pack(fill=tk.X, pady=10, ipady=8)
-
-        self.log_text = tk.Text(main_frame, height=9, state=tk.DISABLED, bg="#1e1e1e", fg="#00ff00", font=("Consolas", 9))
-        self.log_text.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        self.on_profile_change()
-        self.after(500, self.find_scanners)
-
-    def log(self, message):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
-
-    def safe_log(self, message):
-        self.after(0, self.log, message)
-
-    def browse_directory(self):
-        directory = filedialog.askdirectory(initialdir=self.dir_var.get(), title="Select Target Directory")
-        if directory:
-            self.dir_var.set(directory)
-
-    def reset_counter(self):
-        self.scan_counter = 0
-        self.log("Index reset. Next sequence index will be: 001")
-
-    def on_profile_change(self, event=None):
-        selection = self.profile_var.get()
-        coords = self.profiles.get(selection)
-        if coords is not None:
-            self.left_var.set(coords[0])
-            self.top_var.set(coords[1])
-            self.width_var.set(coords[2])
-            self.height_var.set(coords[3])
-            state = "disabled"
-        else:
-            state = "normal" if selection == "Custom Region" else "disabled"
-        for widget in [self.left_spin, self.top_spin, self.width_spin, self.height_spin]:
-            widget.config(state=state)
-
-    def get_selected_scanner(self):
-        selection = self.scanner_list.curselection()
-        if not selection:
-            if self.scanner_list.size() > 0:
-                return self.scanner_list.get(0)
-            else:
-                self.log("Error: No scanner selected or available!")
-                return None
-        return self.scanner_list.get(selection[0])
-
-    def find_scanners(self):
-        self.refresh_btn.config(state=tk.DISABLED)
-        self.log("Searching for scanners...")
-        self.scanner_list.delete(0, tk.END)
-        threading.Thread(target=self._find_scanners_thread, daemon=True).start()
-
-    def _find_scanners_thread(self):
+    def _find_scanners(self):
+        devices = []
         try:
-            devices = []
             if self.is_windows:
                 result = subprocess.run(['naps2.console', '/getdevices'], capture_output=True, text=True, check=True)
                 for line in result.stdout.splitlines():
@@ -180,105 +44,61 @@ class FilmScannerApp(tk.Tk):
             else:
                 result = subprocess.run(['scanimage', '-L'], capture_output=True, text=True, check=True)
                 devices = re.findall(r"device ['`](.*?)['`]", result.stdout)
-            self.after(0, self._update_scanner_list, devices)
+            self.finished_signal.emit(True, "\n".join(devices))
         except Exception as e:
-            self.safe_log(f"Scanner discovery failed: {e}. Is NAPS2/SANE installed in PATH?")
-            self.after(0, lambda: self.refresh_btn.config(state=tk.NORMAL))
+            self.log_signal.emit(f"Scanner discovery failed: {e}. Is NAPS2/SANE installed?")
+            self.finished_signal.emit(False, "")
 
-    def _update_scanner_list(self, devices):
-        if devices:
-            for dev in devices:
-                self.scanner_list.insert(tk.END, dev)
-            self.scanner_list.selection_set(0)
-            self.log(f"Devices detected: {len(devices)}")
-        else:
-            self.log("Warning: No compatible scanner found.")
-        self.refresh_btn.config(state=tk.NORMAL)
+    def _build_cmd(self):
+        res = self.kwargs.get('res', 300)
+        l, t = self.kwargs.get('left', 0), self.kwargs.get('top', 0)
+        w, h = self.kwargs.get('width', 0), self.kwargs.get('height', 0)
+        profile = self.kwargs.get('profile', "Full Bed Area")
+        raw_mode = self.kwargs.get('raw_mode', True)
 
-    def build_base_command(self):
-        res = self.res_var.get()
-        profile = self.profile_var.get()
-        l, t, x, y = self.left_var.get(), self.top_var.get(), self.width_var.get(), self.height_var.get()
-        
         if self.is_windows:
             cmd = ['/r', str(res), '/bitdepth', '16']
-            if profile != "Full Bed Area" and x > 0 and y > 0:
-                cmd.extend(['/crop', f'{l}mm,{t}mm,{x}mm,{y}mm'])
+            if profile != "Full Bed Area" and w > 0 and h > 0:
+                cmd.extend(['/crop', f'{l}mm,{t}mm,{w}mm,{h}mm'])
         else:
             cmd = ['--format=tiff', '--mode=Color', '--depth=16', f'--resolution={res}', '--source', 'Transparency Unit']
-            if self.raw_mode_var.get():
+            if raw_mode:
                 cmd.append('--color-correction=None')
-            if profile != "Full Bed Area" and x > 0 and y > 0:
-                cmd.extend(['-l', str(l), '-t', str(t), '-x', str(x), '-y', str(y)])
+            if profile != "Full Bed Area" and w > 0 and h > 0:
+                cmd.extend(['-l', str(l), '-t', str(t), '-x', str(w), '-y', str(h)])
         return cmd
 
-    def start_warmup(self):
-        device_name = self.get_selected_scanner()
-        if not device_name: return
-        self.scan_btn.config(state=tk.DISABLED)
-        self.warmup_btn.config(state=tk.DISABLED)
-        threading.Thread(target=self.run_warmup_thread, args=(device_name,), daemon=True).start()
-
-    def run_warmup_thread(self, device_name):
-        self.safe_log("\n--- STARTING LAMP WARM-UP ---")
-        cmd_opts = self.build_base_command()
-        
+    def _run_warmup(self):
+        device_name = self.kwargs.get('device_name')
+        cmd_opts = self._build_cmd()
+        self.log_signal.emit("\n--- STARTING LAMP WARM-UP ---")
         try:
             for i in range(1, 4):
-                self.safe_log(f"Blank exposure ({i}/3) in progress...")
+                self.log_signal.emit(f"Blank exposure ({i}/3) in progress...")
                 if self.is_windows:
-                    # Windows: Mentés átmeneti fájlba, majd azonnali törlés (RAM és disk kímélése)
                     tmp_file = tempfile.mktemp(suffix=".tif")
                     subprocess.run(['naps2.console', '/o', tmp_file, '/d', device_name] + cmd_opts, check=True)
                     if os.path.exists(tmp_file): os.remove(tmp_file)
                 else:
-                    # Linux: stdout irányítása a semmibe (DEVNULL) -> Nem eszi a RAM-ot!
                     subprocess.run(['scanimage', '-d', device_name] + cmd_opts, stdout=subprocess.DEVNULL, check=True)
-                    
-            self.safe_log("✔ Warm-up complete. Lamp temperature stabilized.")
+            self.log_signal.emit("✔ Warm-up complete. Lamp temperature stabilized.")
+            self.finished_signal.emit(True, "Warmup Done")
         except Exception as e:
-            self.safe_log(f"❌ Warm-up failed: {e}")
-        finally:
-            self.after(0, lambda: self.scan_btn.config(state=tk.NORMAL))
-            self.after(0, lambda: self.warmup_btn.config(state=tk.NORMAL))
+            self.log_signal.emit(f"❌ Warm-up failed: {e}")
+            self.finished_signal.emit(False, str(e))
 
-    def start_scan(self):
-        device_name = self.get_selected_scanner()
-        if not device_name: return
-        directory = self.dir_var.get()
-        if not os.path.isdir(directory):
-            self.log("Error: Target directory does not exist!")
-            return
-
-        self.scan_counter += 1
-        base = self.base_name_var.get().strip() or "film"
-        if self.add_date_var.get():
-            filename_str = f"{datetime.datetime.now().strftime('%Y%m%d')}_{base}_{self.scan_counter:03d}.tif"
-        else:
-            filename_str = f"{base}_{self.scan_counter:03d}.tif"
-            
-        current_filename = os.path.join(directory, filename_str)
-        self.log(f"\n--- ACQUISITION STARTED: {filename_str} ---")
-
-        self.scan_btn.config(state=tk.DISABLED)
-        self.warmup_btn.config(state=tk.DISABLED)
-        
-        threading.Thread(target=self.run_scan_thread, args=(device_name, current_filename), daemon=True).start()
-
-    def run_scan_thread(self, device_name, final_filename):
-        cmd_opts = self.build_base_command()
-        num_scans = self.num_scans_var.get()
-        apply_lra = self.lra_var.get()
-        dpi = int(self.res_var.get())
-        left_offset_mm = self.left_var.get()
+    def _run_scan(self):
+        device_name = self.kwargs.get('device_name')
+        final_filename = self.kwargs.get('filename')
+        num_scans = self.kwargs.get('num_scans', 3)
+        dpi = int(self.kwargs.get('res', 300))
+        cmd_opts = self._build_cmd()
         
         temp_files = []
         try:
-            # 1. TÖBBSZÖRÖS SZKENNELÉS
             for i in range(num_scans):
-                self.safe_log(f"Scanning pass {i+1} of {num_scans}...")
+                self.log_signal.emit(f"Scanning pass {i+1} of {num_scans}...")
                 tmp_file = tempfile.mktemp(suffix=".tif")
-                
                 if self.is_windows:
                     subprocess.run(['naps2.console', '/o', tmp_file, '/d', device_name] + cmd_opts, check=True)
                 else:
@@ -287,49 +107,261 @@ class FilmScannerApp(tk.Tk):
                         f.write(process.stdout)
                 temp_files.append(tmp_file)
 
-            # 2. ÁTLAGOLÁS (Szenzorzaj csökkentése)
-            self.safe_log("Processing and averaging scans...")
+            self.log_signal.emit("Processing and averaging scans...")
             arrays = [tifffile.imread(f).astype(np.float32) for f in temp_files]
             avg_img = np.mean(arrays, axis=0)
-            
-            # 3. LRA (LATERAL RESPONSE ARTIFACT) KORREKCIÓ
-            if apply_lra and avg_img.ndim >= 2:
-                self.safe_log("Applying geometric LRA flat-field correction...")
-                h, w = avg_img.shape[:2]
-                
-                # A szkenner optikai tengelye (Epson gépeknél az üveglap közepe) ~ 108 mm
-                # Kiszámítjuk minden pixel fizikai X koordinátáját (mm)
-                x_mm = left_offset_mm + np.arange(w) * (25.4 / dpi)
-                dist_from_center = x_mm - 108.0
-                
-                # EBT3 LRA intenzitás korrekció (Tipikus Epson paraméter: 1.5e-5)
-                # A fényszórás miatt a széleken alacsonyabb a mért intenzitás (hamis sötétedés/magas OD)
-                # Ezzel a szorzóval kompenzáljuk az intenzitást a szélek felé haladva.
-                lra_factor = 1.0 + 1.5e-5 * (dist_from_center ** 2)
-                
-                # A szorzót alkalmazzuk minden pixeloszlopra (színcsatornától függetlenül)
-                if avg_img.ndim == 3:
-                    avg_img = avg_img * lra_factor[None, :, None]
-                else:
-                    avg_img = avg_img * lra_factor[None, :]
-                    
-            # 4. MENTÉS
             avg_img = np.clip(avg_img, 0, 65535)
-            tifffile.imwrite(final_filename, avg_img.astype(np.uint16))
-            self.safe_log(f"✔ Final TIFF saved: {os.path.basename(final_filename)}")
-            self.scanned_files.append(final_filename)
 
+            # Pozíció lekérése a GUI beállításokból
+            left_offset_mm = float(self.kwargs.get('left', 0.0))
+            
+            # Metaadat string generálása
+            metadata_str = f"left_mm={left_offset_mm};scanner_center_mm=108.0"
+
+            # DPI metaadat mentése a TIFF fájlba
+            tifffile.imwrite(final_filename, 
+                             avg_img.astype(np.uint16),
+                             resolution=(dpi, dpi),
+                             description=metadata_str)
+            
+            self.log_signal.emit(f"✔ Final TIFF saved (with {dpi} DPI tag): {os.path.basename(final_filename)}")
+            self.finished_signal.emit(True, final_filename)
         except Exception as e:
-            self.safe_log(f"❌ Acquisition error: {str(e)}")
+            self.log_signal.emit(f"❌ Acquisition error: {e}")
+            self.finished_signal.emit(False, str(e))
         finally:
-            # Takarítás
             for f in temp_files:
                 if os.path.exists(f): os.remove(f)
-            self.after(0, lambda: self.scan_btn.config(state=tk.NORMAL))
-            self.after(0, lambda: self.warmup_btn.config(state=tk.NORMAL))
+
+class FilmScannerDialog(QDialog):
+    def __init__(self, target_directory=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PRISM - Radiochromic Film Scanner (EBT3)")
+        self.resize(650, 750)
+        self.is_windows = platform.system() == "Windows"
+        self.scan_counter = 0
+
+        if target_directory and os.path.isdir(target_directory):
+            self.target_dir = os.path.abspath(target_directory)
+        else:
+            self.target_dir = os.path.expanduser("~")
+
+        self._init_ui()
+        self.find_scanners()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 1. Scanners
+        layout.addWidget(QLabel(f"<b>Available Scanners ({'NAPS2' if self.is_windows else 'SANE'}):</b>"))
+        self.list_scanners = QListWidget()
+        self.list_scanners.setFixedHeight(60)
+        layout.addWidget(self.list_scanners)
+
+        hbox_scan_btns = QHBoxLayout()
+        self.btn_refresh = QPushButton("🔄 Refresh Scanners")
+        self.btn_refresh.clicked.connect(self.find_scanners)
+        self.btn_warmup = QPushButton("🔥 Fast Warm-up (3x Blank)")
+        self.btn_warmup.clicked.connect(self.start_warmup)
+        hbox_scan_btns.addWidget(self.btn_refresh)
+        hbox_scan_btns.addWidget(self.btn_warmup)
+        layout.addLayout(hbox_scan_btns)
+
+        # 2. Directory & Naming
+        grp_dir = QGroupBox("Save Destination & Naming")
+        lay_dir = QGridLayout(grp_dir)
+        self.txt_dir = QLineEdit(self.target_dir)
+        self.btn_browse = QPushButton("Browse...")
+        self.btn_browse.clicked.connect(self.browse_dir)
+        lay_dir.addWidget(QLabel("Target Dir:"), 0, 0)
+        lay_dir.addWidget(self.txt_dir, 0, 1)
+        lay_dir.addWidget(self.btn_browse, 0, 2)
+
+        lay_dir.addWidget(QLabel("Prefix:"), 1, 0)
+        self.txt_prefix = QLineEdit("film")
+        self.chk_date = QCheckBox("Append Date")
+        self.chk_date.setChecked(True)
+        self.btn_reset_idx = QPushButton("Reset Index")
+        self.btn_reset_idx.clicked.connect(self.reset_index)
+        
+        hbox_name = QHBoxLayout()
+        hbox_name.addWidget(self.txt_prefix)
+        hbox_name.addWidget(self.chk_date)
+        hbox_name.addWidget(self.btn_reset_idx)
+        lay_dir.addLayout(hbox_name, 1, 1, 1, 2)
+        layout.addWidget(grp_dir)
+
+        # 3. Geometry
+        grp_geo = QGroupBox("Scan Area & Geometry")
+        lay_geo = QGridLayout(grp_geo)
+        self.combo_profile = QComboBox()
+        self.profiles = {
+            "Standard Film (50.4 x 48.4 mm)": (136.0, 122.0, 50.4, 48.4),
+            "Calibration Strip (30 x 150 mm)": (120.0, 50.0, 30.0, 150.0),
+            "Full Bed Area": None,
+            "Custom Region": None
+        }
+        self.combo_profile.addItems(list(self.profiles.keys()))
+        self.combo_profile.currentIndexChanged.connect(self.on_profile_change)
+        lay_geo.addWidget(QLabel("Preset Profile:"), 0, 0)
+        lay_geo.addWidget(self.combo_profile, 0, 1, 1, 3)
+
+        self.spins = {}
+        for i, (lbl, key) in enumerate([("Left (mm):", "left"), ("Top (mm):", "top"), ("Width (mm):", "width"), ("Height (mm):", "height")]):
+            row = 1 + (i // 2)
+            col = (i % 2) * 2
+            lay_geo.addWidget(QLabel(lbl), row, col)
+            spin = QDoubleSpinBox()
+            spin.setRange(0, 500)
+            spin.setDecimals(1)
+            self.spins[key] = spin
+            lay_geo.addWidget(spin, row, col + 1)
+        layout.addWidget(grp_geo)
+        self.on_profile_change()
+
+        # 4. Physics
+        grp_phys = QGroupBox("Advanced Scanning (Physics & Averaging)")
+        lay_phys = QGridLayout(grp_phys)
+        lay_phys.addWidget(QLabel("Scans to Average:"), 0, 0)
+        self.spin_scans = QSpinBox()
+        self.spin_scans.setRange(1, 5)
+        self.spin_scans.setValue(3)
+        lay_phys.addWidget(self.spin_scans, 0, 1)
+
+        lay_phys.addWidget(QLabel("DPI:"), 0, 2)
+        self.combo_dpi = QComboBox()
+        self.combo_dpi.addItems(["75", "150", "300", "600"])
+        self.combo_dpi.setCurrentText("300")
+        lay_phys.addWidget(self.combo_dpi, 0, 3)
+
+        self.chk_raw = QCheckBox("Force RAW Mode (No Color Correction)")
+        self.chk_raw.setChecked(True)
+        lay_phys.addWidget(self.chk_raw, 1, 0, 1, 4)
+        layout.addWidget(grp_phys)
+
+        # 5. Run & Log
+        self.btn_scan = QPushButton("▶ Start Acquisition (Scan & Average)")
+        self.btn_scan.setStyleSheet("background-color: #2b8a3e; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        self.btn_scan.clicked.connect(self.start_scan)
+        layout.addWidget(self.btn_scan)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
+        layout.addWidget(self.log_text)
+
+    def write_log(self, text):
+        self.log_text.append(text)
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+    def reset_index(self):
+        self.scan_counter = 0
+        self.write_log("Index reset. Next sequence index will be: 001")
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Target Directory", self.txt_dir.text())
+        if d:
+            self.txt_dir.setText(d)
+
+    def on_profile_change(self):
+        sel = self.combo_profile.currentText()
+        coords = self.profiles.get(sel)
+        enabled = sel == "Custom Region"
+        for key, spin in self.spins.items():
+            if coords is not None:
+                idx = ["left", "top", "width", "height"].index(key)
+                spin.setValue(coords[idx])
+            spin.setEnabled(enabled)
+
+    def get_selected_scanner(self):
+        items = self.list_scanners.selectedItems()
+        if not items:
+            if self.list_scanners.count() > 0:
+                return self.list_scanners.item(0).text()
+            self.write_log("Error: No scanner found!")
+            return None
+        return items[0].text()
+
+    def set_ui_busy(self, busy):
+        self.btn_scan.setEnabled(not busy)
+        self.btn_warmup.setEnabled(not busy)
+        self.btn_refresh.setEnabled(not busy)
+
+    def find_scanners(self):
+        self.set_ui_busy(True)
+        self.list_scanners.clear()
+        self.write_log("Searching for scanners...")
+        self.worker = ScanWorker("find_scanners")
+        self.worker.log_signal.connect(self.write_log)
+        self.worker.finished_signal.connect(self._on_scanners_found)
+        self.worker.start()
+
+    def _on_scanners_found(self, success, data):
+        self.set_ui_busy(False)
+        if success and data:
+            devices = data.split("\n")
+            self.list_scanners.addItems(devices)
+            self.list_scanners.setCurrentRow(0)
+            self.write_log(f"Devices detected: {len(devices)}")
+        else:
+            self.write_log("Warning: No compatible scanner found.")
+
+    def get_kwargs(self):
+        return {
+            'res': self.combo_dpi.currentText(),
+            'left': self.spins['left'].value(),
+            'top': self.spins['top'].value(),
+            'width': self.spins['width'].value(),
+            'height': self.spins['height'].value(),
+            'profile': self.combo_profile.currentText(),
+            'raw_mode': self.chk_raw.isChecked(),
+            'num_scans': self.spin_scans.value()
+        }
+
+    def start_warmup(self):
+        dev = self.get_selected_scanner()
+        if not dev: return
+        self.set_ui_busy(True)
+        kwargs = self.get_kwargs()
+        kwargs['device_name'] = dev
+        self.worker = ScanWorker("warmup", **kwargs)
+        self.worker.log_signal.connect(self.write_log)
+        self.worker.finished_signal.connect(lambda s, msg: self.set_ui_busy(False))
+        self.worker.start()
+
+    def start_scan(self):
+        dev = self.get_selected_scanner()
+        if not dev: return
+        target = self.txt_dir.text()
+        if not os.path.isdir(target):
+            QMessageBox.warning(self, "Error", "Target directory does not exist!")
+            return
+
+        self.scan_counter += 1
+        base = self.txt_prefix.text().strip() or "film"
+        if self.chk_date.isChecked():
+            fname = f"{datetime.datetime.now().strftime('%Y%m%d')}_{base}_{self.scan_counter:03d}.tif"
+        else:
+            fname = f"{base}_{self.scan_counter:03d}.tif"
+        full_path = os.path.join(target, fname)
+
+        self.write_log(f"\n--- ACQUISITION STARTED: {fname} ---")
+        self.set_ui_busy(True)
+        
+        kwargs = self.get_kwargs()
+        kwargs['device_name'] = dev
+        kwargs['filename'] = full_path
+        
+        self.worker = ScanWorker("scan", **kwargs)
+        self.worker.log_signal.connect(self.write_log)
+        self.worker.finished_signal.connect(lambda s, msg: self.set_ui_busy(False))
+        self.worker.start()
 
 
 if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     target_dir = sys.argv[1] if len(sys.argv) > 1 else None
-    app = FilmScannerApp(target_directory=target_dir)
-    app.mainloop()
+    window = FilmScannerDialog(target_directory=target_dir)
+    window.show()
+    sys.exit(app.exec_())

@@ -341,10 +341,6 @@ class PrismDosimetryGUI(QMainWindow):
         proc_layout.addWidget(self.list_proc_files)
         layout.addWidget(proc_group)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.hide()
-        layout.addWidget(self.progress_bar)
-
         # Folyamatjelző
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0) # Végtelenített indikátor futás közben
@@ -1419,7 +1415,8 @@ class PrismDosimetryGUI(QMainWindow):
             
             if self.current_std_map is not None:
                 # Szórás propagálása az átlagolt sávra
-                std_x = np.mean(self.current_std_map[y_low:y_high, x1:x2], axis=0)
+                N_pixels_y = y_high - y_low
+                std_x = np.sqrt(np.sum(self.current_std_map[y_low:y_high, x1:x2]**2, axis=0)) / N_pixels_y
                 self.curve_prof_x_up.setData(x_px, prof_x + std_x)
                 self.curve_prof_x_dn.setData(x_px, np.maximum(0, prof_x - std_x))
 
@@ -1431,7 +1428,8 @@ class PrismDosimetryGUI(QMainWindow):
             self.curve_prof_y.setData(prof_y, y_px)
             
             if self.current_std_map is not None:
-                std_y = np.mean(self.current_std_map[y1:y2, x_low:x_high], axis=1)
+                N_pixels_x = x_high - x_low
+                std_y = np.sqrt(np.sum(self.current_std_map[y1:y2, x_low:x_high]**2, axis=1)) / N_pixels_x
                 self.curve_prof_y_up.setData(prof_y + std_y, y_px)
                 self.curve_prof_y_dn.setData(np.maximum(0, prof_y - std_y), y_px)
 
