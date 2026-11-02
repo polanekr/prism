@@ -149,7 +149,9 @@ class BioDosimetryTab(QWidget):
         self.back_std = None
         self.spacing = 0.0846  # Default 300 DPI mm/pixel
         self.rois = []
+        self.results_data = {}
         self.geometry = BioSampleGeometry()
+
         
         self._init_ui()
 
@@ -330,21 +332,31 @@ class BioDosimetryTab(QWidget):
         right_layout.addWidget(QLabel("<b>Sample Results:</b>"))
         right_layout.addWidget(self.table, stretch=1)
         
+        # --- 1. TÁBLÁZAT ALATTI GOMB: Táblázat adatainak exportálása (CSV/Excel) ---
+        self.btn_export_table = QPushButton("📊 Export Sample Table (CSV / Excel)")
+        self.btn_export_table.setStyleSheet("background-color: #2b5797; color: white; font-weight: bold; padding: 5px;")
+        self.btn_export_table.clicked.connect(self.export_sample_table)
+        right_layout.addWidget(self.btn_export_table)
+
         self.btn_export = QPushButton("💾 Export 3D Volumetric Data (.npz)")
         self.btn_export.clicked.connect(self.export_numpy)
         right_layout.addWidget(self.btn_export)
 
+        # DVH Grafikon
         self.plot_dvh = pg.PlotWidget(title="Differential Dose-Volume Histogram (dDVH)")
         self.plot_dvh.setLabel('bottom', 'Dose [Gy]')
         self.plot_dvh.setLabel('left', 'Relative Volume [%]')
         self.curve_dvh = self.plot_dvh.plot(stepMode="center", fillLevel=0, fillOutline=True, brush=(0, 150, 255, 90), pen=pg.mkPen('c', width=2))
         right_layout.addWidget(self.plot_dvh, stretch=1)
         
+        # --- 2. HISZTOGRAM ALATTI GOMB: dDVH CSV exportálása ---
+        self.btn_export_ddvh = QPushButton("📈 Export dDVH Data (CSV)")
+        self.btn_export_ddvh.setStyleSheet("background-color: #0078D7; color: white; font-weight: bold; padding: 5px;")
+        self.btn_export_ddvh.clicked.connect(self.export_csv)
+        right_layout.addWidget(self.btn_export_ddvh)
+        
         splitter.addWidget(right_panel)
         splitter.setSizes([300, 700, 400])
-        
-        # Adattároló a számolt ROI eredményeknek
-        self.results_data = {}
 
     def update_blend(self):
         """Vezérli az elülső és hátsó film láthatóságát (0: csak Back, 100: csak Front)."""
@@ -717,6 +729,66 @@ class BioDosimetryTab(QWidget):
             QMessageBox.information(self, "Exported", f"Data saved to {path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
+
+    def export_sample_table(self):
+        """A mintastatisztikai táblázat mentése CSV vagy Excel fájlba."""
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        
+        row_count = self.table.rowCount()
+        col_count = self.table.columnCount()
+        if row_count == 0:
+            QMessageBox.warning(self, "Export Error", "The table is empty. Calculate sample doses first!")
+            return
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Sample Metrics",
+            "sample_metrics.csv",
+            "CSV Files (*.csv);;Excel Files (*.xlsx)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            # Fejlécek
+            headers = []
+            for col in range(col_count):
+                item = self.table.horizontalHeaderItem(col)
+                headers.append(item.text() if item else f"Column_{col+1}")
+
+            # Sorok adatai
+            rows = []
+            for r in range(row_count):
+                row_vals = []
+                for c in range(col_count):
+                    it = self.table.item(r, c)
+                    txt = it.text() if it else ""
+                    try:
+                        val = float(txt)
+                    except ValueError:
+                        val = txt
+                    row_vals.append(val)
+                rows.append(row_vals)
+
+            if file_path.endswith('.xlsx') or "Excel" in selected_filter:
+                import pandas as pd
+                if not file_path.endswith('.xlsx'):
+                    file_path += '.xlsx'
+                df = pd.DataFrame(rows, columns=headers)
+                df.to_excel(file_path, index=False)
+            else:
+                import csv
+                if not file_path.endswith('.csv'):
+                    file_path += '.csv'
+                with open(file_path, mode='w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    writer.writerows(rows)
+
+            QMessageBox.information(self, "Export Successful", f"Sample metrics saved to:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export table data:\n{str(e)}")
 
     def _create_eppendorf_points(self, center_x, center_y, width_mm=4.0, height_mm=6.0):
         """

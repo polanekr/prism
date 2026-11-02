@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QCheckBox, QLineEdit, QGroupBox, QTabWidget, 
     QSplitter, QMessageBox, QProgressBar, QAbstractItemView,
     QDialog, QDialogButtonBox, QSlider, QSpinBox, QGraphicsPathItem,
-    QTextEdit, QScrollArea
+    QTextEdit, QScrollArea, QFrame
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPainter, QPageSize, QPdfWriter, QPainterPath
@@ -24,8 +24,8 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 # Force pyqtgraph to use PyQt5
 os.environ["PYQTGRAPH_QT_LIB"] = "PyQt5"
 import pyqtgraph as pg
-
-from dosimetry import GafchromicEngine, BAYES_AVAILABLE
+import pyqtgraph.exporters
+from dosimetry import GafchromicEngine, BAYES_AVAILABLE, BeamMorphology
 from bio_dosimetry import BioDosimetryTab
 pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
 
@@ -234,6 +234,8 @@ class PrismDosimetryGUI(QMainWindow):
         
         self.viewer_tab = self._create_viewer_tab()
         self.tabs.addTab(self.viewer_tab, "🔬 LWFA Beam Analysis & Profiles")
+        self.morphology_tab = MorphologyTab(self)
+        self.tabs.addTab(self.morphology_tab, "🌌 Advanced Beam Morphology")
         self.bio_tab = BioDosimetryTab()
         self.tabs.addTab(self.bio_tab, "🧬 Radiobiology & 3D Sample Dosimetry")
         self.tabs.addTab(self._create_placeholder_tab("Magnetic Spectrometer & Dispersion", "WIP"), "⚡ Spectrometer (WIP)")
@@ -532,11 +534,11 @@ class PrismDosimetryGUI(QMainWindow):
         self.h_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('c', width=1.5, style=Qt.DashLine))
         self.plot_dose.addItem(self.v_line, ignoreBounds=True)
         self.plot_dose.addItem(self.h_line, ignoreBounds=True)
-        self.v_line.sigPositionChanged.connect(self._on_crosshair_moved)
-        self.h_line.sigPositionChanged.connect(self._on_crosshair_moved)
+        self.v_line.sigPositionChangeFinished.connect(self._on_crosshair_moved)
+        self.h_line.sigPositionChangeFinished.connect(self._on_crosshair_moved)
 
         self.line_roi = pg.LineSegmentROI([[20, 20], [80, 80]], pen=pg.mkPen('y', width=2.5))
-        self.line_roi.sigRegionChanged.connect(self._on_oblique_moved)
+        self.line_roi.sigRegionChangeFinished.connect(self._on_oblique_moved)
         self.plot_dose.addItem(self.line_roi)
         self.line_roi.hide()
 
@@ -544,11 +546,11 @@ class PrismDosimetryGUI(QMainWindow):
         self.film_boundary.addScaleHandle([1, 1], [0, 0])
         self.film_boundary.addScaleHandle([0, 0], [1, 1])
         self.plot_dose.addItem(self.film_boundary)
-        self.film_boundary.sigRegionChanged.connect(self.update_boundary_and_profiles)
+        self.film_boundary.sigRegionChangeFinished.connect(self.update_boundary_and_profiles)
 
         self.roi = pg.EllipseROI([50, 50], [100, 100], pen=pg.mkPen('w', width=2))
         self.plot_dose.addItem(self.roi)
-        self.roi.sigRegionChanged.connect(self.update_roi_stats)
+        self.roi.sigRegionChangeFinished.connect(self.update_roi_stats)
 
         dose_layout.addWidget(self.glw_dose)
         images_splitter.addWidget(dose_widget)
@@ -1730,21 +1732,41 @@ class PrismDosimetryGUI(QMainWindow):
 
     def _fit_2d_gaussian(self, data, mask, spacing):
         try:
+            # --- SEBESSÉG OPTIMALIZÁLÁS: Leskálázás a gyors illesztéshez ---
+            max_fit_size = 120  # Maximális mátrixméret az illesztéshez
             h, w = data.shape
-            x, y = np.arange(w) * spacing, np.arange(h) * spacing
+            
+            if max(h, w) > max_fit_size:
+                from scipy.ndimage import zoom
+                scale = max_fit_size / max(h, w)
+                
+                # Mátrix és maszk leskálázása
+                data_fit = zoom(data, scale, order=1)
+                mask_fit = zoom(mask.astype(float), scale, order=0).astype(bool)
+                
+                # Pixelméret korrekciója, hogy a fizikai mm értékek helyesek maradjanak
+                spacing_fit = spacing / scale
+            else:
+                data_fit = data
+                mask_fit = mask
+                spacing_fit = spacing
+
+            h_f, w_f = data_fit.shape
+            x, y = np.arange(w_f) * spacing_fit, np.arange(h_f) * spacing_fit
             X, Y = np.meshgrid(x, y)
 
-            fit_x = (X[mask], Y[mask])
-            fit_y = data[mask]
+            fit_x = (X[mask_fit], Y[mask_fit])
+            fit_y = data_fit[mask_fit]
 
             amp0 = float(np.max(fit_y))
-            xo0, yo0 = float(w * spacing / 2.0), float(h * spacing / 2.0)
+            xo0, yo0 = float(w_f * spacing_fit / 2.0), float(h_f * spacing_fit / 2.0)
+            
             # Paraméterek: amp, xo, yo, sigma_x, sigma_y, theta, offset, P (Shape)
             p0 = [amp0, xo0, yo0, xo0 / 3.0, yo0 / 3.0, 0.0, float(np.min(fit_y)), 1.0]
 
             bounds = (
                 [0, 0, 0, 0.05, 0.05, -np.pi, 0, 0.2],
-                [amp0 * 2.0, w * spacing, h * spacing, w * spacing, h * spacing, np.pi, amp0, 5.0]
+                [amp0 * 2.0, w_f * spacing_fit, h_f * spacing_fit, w_f * spacing_fit, h_f * spacing_fit, np.pi, amp0, 5.0]
             )
 
             popt, _ = curve_fit(twoD_SuperGaussian, fit_x, fit_y, p0=p0, bounds=bounds, maxfev=1500)
@@ -1752,6 +1774,317 @@ class PrismDosimetryGUI(QMainWindow):
         except Exception:
             return None
 
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QCheckBox, QSplitter
+from PyQt5.QtCore import Qt
+import pyqtgraph as pg
+import numpy as np
+
+# A backend importja (a fenti kódból)
+# from dosimetry import BeamMorphology
+
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
+    QCheckBox, QComboBox, QSlider, QFrame, QMessageBox
+)
+from PyQt5.QtCore import Qt
+import pyqtgraph as pg
+import pyqtgraph.exporters
+import numpy as np
+import os
+import json
+import traceback
+
+class MorphologyTab(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.current_metrics = {}
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        
+        # --- VEZÉRLŐ ÉS STATISZTIKAI PANEL ---
+        panel_frame = QFrame()
+        panel_frame.setStyleSheet("""
+            QFrame#ControlPanel {
+                background-color: #2e3440;
+                border: 1px solid #4c566a;
+                border-radius: 6px;
+            }
+        """)
+        panel_frame.setObjectName("ControlPanel")
+        
+        panel_layout = QVBoxLayout(panel_frame)
+        panel_layout.setContentsMargins(10, 8, 10, 8)
+        panel_layout.setSpacing(8)
+
+        # 1. sor: Gombok, beállítások
+        row1 = QHBoxLayout()
+        self.btn_analyze = QPushButton("🔬 Run Analysis")
+        self.btn_analyze.setStyleSheet("background-color: #5e81ac; color: #eceff4; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
+        self.btn_analyze.clicked.connect(self.run_analysis)
+        row1.addWidget(self.btn_analyze)
+
+        lbl_mode = QLabel("<b>Mode:</b>")
+        lbl_mode.setStyleSheet("color: #eceff4;")
+        row1.addWidget(lbl_mode)
+
+        self.combo_shot_mode = QComboBox()
+        self.combo_shot_mode.addItems(["Multi-shot (500 Hz Accumulation)", "Single-shot (Instantaneous)"])
+        self.combo_shot_mode.setStyleSheet("color: #eceff4; background-color: #3b4252; padding: 3px;")
+        row1.addWidget(self.combo_shot_mode)
+        
+        self.chk_snr_mask = QCheckBox("Apply SNR > 3 Mask")
+        self.chk_snr_mask.setStyleSheet("color: #eceff4;")
+        row1.addWidget(self.chk_snr_mask)
+        
+        self.lbl_sigma = QLabel("<b>Scatter σ:</b> 0.0 mm")
+        self.lbl_sigma.setStyleSheet("color: #eceff4;")
+        row1.addWidget(self.lbl_sigma)
+        
+        self.slider_sigma = QSlider(Qt.Horizontal)
+        self.slider_sigma.setRange(0, 30)
+        self.slider_sigma.setValue(0)
+        self.slider_sigma.setFixedWidth(110)
+        self.slider_sigma.valueChanged.connect(self.on_sigma_changed)
+        row1.addWidget(self.slider_sigma)
+        
+        self.btn_export = QPushButton("💾 Save Data & Figures")
+        self.btn_export.setStyleSheet("background-color: #88c0d0; color: #2e3440; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
+        self.btn_export.clicked.connect(self.export_figures)
+        row1.addWidget(self.btn_export)
+        
+        row1.addStretch()
+        panel_layout.addLayout(row1)
+
+        # 2. sor: Statisztikák (kifejezetten látható, explicit színekkel)
+        row2 = QHBoxLayout()
+        self.lbl_moments = QLabel("<b>Skewness:</b> - | <b>Kurtosis:</b> - | <b>Entropy:</b> -")
+        self.lbl_moments.setStyleSheet("color: #eceff4; font-size: 12px;")
+        row2.addWidget(self.lbl_moments)
+
+        sep1 = QLabel("|")
+        sep1.setStyleSheet("color: #4c566a; font-weight: bold;")
+        row2.addWidget(sep1)
+
+        self.lbl_radiobio = QLabel("<b>PVDR:</b> - | <b>FHV:</b> - % | <b>LDG:</b> - Gy/mm | <b>Lacunarity:</b> -")
+        self.lbl_radiobio.setStyleSheet("color: #b48ead; font-size: 12px; font-weight: bold;")
+        row2.addWidget(self.lbl_radiobio)
+
+        sep2 = QLabel("|")
+        sep2.setStyleSheet("color: #4c566a; font-weight: bold;")
+        row2.addWidget(sep2)
+
+        self.lbl_watershed = QLabel("<b>Islands:</b> - | <b>Mean Area:</b> - mm² | <b>Dose in Islands:</b> - %")
+        self.lbl_watershed.setStyleSheet("color: #a3be8c; font-size: 12px; font-weight: bold;")
+        row2.addWidget(self.lbl_watershed)
+        
+        row2.addStretch()
+        panel_layout.addLayout(row2)
+
+        layout.addWidget(panel_frame)
+
+        # --- VIZUALIZÁCIÓS RÁCS (2 sor × 4 oszlop) ---
+        self.glw = pg.GraphicsLayoutWidget()
+        layout.addWidget(self.glw, stretch=1)
+
+        # 1. sor: PSD, 2D Autocorr, Radial Autocorr, Radon Sinogram
+        self.plot_psd = self.glw.addPlot(title="2D Power Spectrum (PSD)", row=0, col=0)
+        self.img_psd = pg.ImageItem()
+        self.plot_psd.addItem(self.img_psd)
+        self.plot_psd.setAspectLocked(True)
+        
+        self.plot_autocorr = self.glw.addPlot(title="2D Autocorrelation", row=0, col=1)
+        self.img_autocorr = pg.ImageItem()
+        self.plot_autocorr.addItem(self.img_autocorr)
+        self.plot_autocorr.setAspectLocked(True)
+
+        self.plot_rad_ac = self.glw.addPlot(title="Radial Autocorr (Size Scale)", row=0, col=2)
+        self.plot_rad_ac.setLabel('bottom', 'Radius [mm]')
+        self.plot_rad_ac.setLabel('left', 'Correlation')
+        self.curve_rad_ac = self.plot_rad_ac.plot(pen=pg.mkPen('#88c0d0', width=2))
+
+        self.plot_radon = self.glw.addPlot(title="Radon Sinogram (Banding)", row=0, col=3)
+        self.img_radon = pg.ImageItem()
+        self.plot_radon.addItem(self.img_radon)
+        self.plot_radon.setLabel('bottom', 'Angle [deg]')
+        
+        # 2. sor: Zernike Reconstruction, Zernike Coefficients (Bar), Watershed Islands
+        self.plot_zernike_map = self.glw.addPlot(title="Zernike Reconstruction", row=1, col=0)
+        self.img_zernike = pg.ImageItem()
+        self.plot_zernike_map.addItem(self.img_zernike)
+        self.plot_zernike_map.setAspectLocked(True)
+
+        self.plot_zernike_bar = self.glw.addPlot(title="Zernike Aberration Modes", row=1, col=1)
+        self.bar_zernike = pg.BarGraphItem(x=[], height=[], width=0.6, brush='#ebcb8b')
+        self.plot_zernike_bar.addItem(self.bar_zernike)
+        self.plot_zernike_bar.setLabel('bottom', 'Mode')
+
+        self.plot_watershed = self.glw.addPlot(title="Watershed Islands (Filaments)", row=1, col=2, colspan=2)
+        self.img_watershed = pg.ImageItem()
+        self.plot_watershed.addItem(self.img_watershed)
+        self.plot_watershed.setAspectLocked(True)
+
+        # Színskálák
+        lut_psd = pg.colormap.get('inferno').getLookupTable()
+        pos = np.array([0.0, 0.5, 1.0])
+        colors = np.array([[0, 50, 255, 255], [255, 255, 255, 255], [255, 50, 0, 255]], dtype=np.ubyte)
+        lut_bipolar = pg.ColorMap(pos, colors).getLookupTable()
+        lut_turbo = pg.colormap.get('turbo').getLookupTable()
+
+        self.img_psd.setLookupTable(lut_psd)
+        self.img_autocorr.setLookupTable(lut_bipolar)
+        self.img_radon.setLookupTable(lut_psd)
+        self.img_zernike.setLookupTable(lut_psd)
+        self.img_watershed.setLookupTable(lut_turbo)
+
+    def on_sigma_changed(self, value):
+        self.lbl_sigma.setText(f"<b>Scatter σ:</b> {value / 10.0:.1f} mm")
+        self.run_analysis()
+
+    def run_analysis(self):
+        if not hasattr(self.main_window, 'current_dose_map') or self.main_window.current_dose_map is None:
+            return
+            
+        dose_map = self.main_window.current_dose_map
+        std_map = getattr(self.main_window, 'current_std_map', None)
+        spacing = float(self.main_window.current_meta.get("pixel_spacing_mm", 0.0846))
+        
+        if not hasattr(self.main_window, 'roi'):
+            return
+            
+        roi_data = self.main_window.roi.getArrayRegion(dose_map, self.main_window.img_item_dose)
+        if roi_data is None or roi_data.size < 9: 
+            return
+        
+        # SNR maszkolás
+        if self.chk_snr_mask.isChecked() and std_map is not None:
+            roi_std = self.main_window.roi.getArrayRegion(std_map, self.main_window.img_item_dose)
+            snr = roi_data / np.maximum(roi_std, 1e-6)
+            roi_data = np.where(snr > 3.0, roi_data, 0.0)
+
+        # Leskálázás a gyors és akadásmentes számításhoz
+        max_size = 300
+        h, w = roi_data.shape
+        if max(h, w) > max_size:
+            from scipy.ndimage import zoom
+            scale = max_size / max(h, w)
+            roi_data = zoom(roi_data, scale, order=1)
+            spacing = spacing / scale
+
+        # Dekonvolúció (PMMA / szóródás kompenzálás)
+        sigma_mm = self.slider_sigma.value() / 10.0
+        if sigma_mm > 0:
+            roi_data = BeamMorphology.deconvolve_scattering(roi_data, sigma_mm, spacing, iterations=15)
+
+        try:
+            # 1. FFT és Autokorreláció
+            psd, autocorr, r_bins, rad_ac = BeamMorphology.compute_fft_and_autocorr(roi_data, spacing)
+            self.img_psd.setImage(psd, autoLevels=True)
+            self.img_autocorr.setImage(autocorr, autoLevels=False)
+            self.img_autocorr.setLevels([-1, 1])
+            self.curve_rad_ac.setData(r_bins, rad_ac)
+            
+            idx_half = np.where(rad_ac < 0.5)[0]
+            cl_val = r_bins[idx_half[0]] if len(idx_half) > 0 else None
+            cl_str = f"{cl_val:.2f} mm" if cl_val is not None else "N/A"
+            self.plot_rad_ac.setTitle(f"Radial Autocorr (Length: {cl_str})")
+
+            # 2. Radon transzformáció
+            sinogram, theta = BeamMorphology.compute_radon_sinogram(roi_data)
+            self.img_radon.setImage(sinogram, autoLevels=True)
+            
+            # 3. Zernike analízis
+            coeffs, labels, z_rec = BeamMorphology.compute_zernike_modes(roi_data)
+            self.img_zernike.setImage(z_rec, autoLevels=True)
+            self.bar_zernike.setOpts(x=np.arange(len(coeffs)), height=coeffs)
+            ticks = [list(zip(range(len(labels)), labels))]
+            self.plot_zernike_bar.getAxis('bottom').setTicks(ticks)
+
+            # 4. Momentumok, Radiobiológiai metrikák és Watershed
+            skewness, kurt = BeamMorphology.compute_moments(roi_data)
+            biometrics = BeamMorphology.compute_radiobiology_metrics(roi_data, spacing)
+            seg_metrics = BeamMorphology.compute_advanced_segmentation_and_entropy(roi_data, spacing)
+            
+            self.img_watershed.setImage(seg_metrics['segmented_map'], autoLevels=True)
+
+            # Szöveges adatok kiírása az UI-ra
+            self.lbl_moments.setText(
+                f"<b>Skewness:</b> {skewness:.2f} | <b>Kurtosis:</b> {kurt:.2f} | <b>Entropy:</b> {seg_metrics['shannon_entropy']:.2f}"
+            )
+            self.lbl_radiobio.setText(
+                f"<b>PVDR:</b> {biometrics['pvdr']:.2f} | "
+                f"<b>FHV (>1.5x):</b> {biometrics['fhv_pct']:.1f}% | "
+                f"<b>Mean LDG:</b> {biometrics['mean_ldg']:.1f} Gy/mm | "
+                f"<b>Lacunarity:</b> {biometrics['lacunarity']:.3f}"
+            )
+            self.lbl_watershed.setText(
+                f"<b>Islands:</b> {seg_metrics['num_islands']} | "
+                f"<b>Mean Area:</b> {seg_metrics['mean_island_area_mm2']:.2f} mm² | "
+                f"<b>Dose in Islands:</b> {seg_metrics['island_dose_fraction_pct']:.1f}%"
+            )
+
+            # Eltárolás későbbi JSON exportáláshoz
+            shot_mode = self.combo_shot_mode.currentText()
+            self.current_metrics = {
+                "shot_mode": shot_mode,
+                "skewness": float(skewness),
+                "kurtosis": float(kurt),
+                "shannon_entropy": seg_metrics['shannon_entropy'],
+                "pvdr": biometrics['pvdr'],
+                "fhv_pct": biometrics['fhv_pct'],
+                "mean_ldg_gy_mm": biometrics['mean_ldg'],
+                "lacunarity": biometrics['lacunarity'],
+                "num_islands": seg_metrics['num_islands'],
+                "mean_island_area_mm2": seg_metrics['mean_island_area_mm2'],
+                "island_dose_fraction_pct": seg_metrics['island_dose_fraction_pct'],
+                "scatter_sigma_mm": float(sigma_mm),
+                "correlation_length_mm": float(cl_val) if cl_val is not None else None,
+                "zernike_coeffs": {lbl: float(c) for lbl, c in zip(labels, coeffs)}
+            }
+        except Exception as e:
+            print(f"[MorphologyTab Exception]: {e}")
+            traceback.print_exc()
+
+    def export_figures(self):
+        if not hasattr(self.main_window, 'analysis_dir') or not self.main_window.analysis_dir:
+            QMessageBox.warning(self, "Export Error", "No active project! Please open a project first.")
+            return
+            
+        out_dir = str(self.main_window.analysis_dir)
+        base_name = getattr(self.main_window, 'current_film_name', 'morphology_scan')
+        
+        plots_to_export = {
+            "psd": self.plot_psd,
+            "autocorr": self.plot_autocorr,
+            "radial_ac": self.plot_rad_ac,
+            "sinogram": self.plot_radon,
+            "zernike_map": self.plot_zernike_map,
+            "zernike_bar": self.plot_zernike_bar,
+            "watershed_islands": self.plot_watershed,
+            "composite_grid": self.glw.scene()
+        }
+        
+        try:
+            # 1. JSON mentés
+            if hasattr(self, 'current_metrics') and self.current_metrics:
+                json_path = os.path.join(out_dir, f"{base_name}_morphology_metrics.json")
+                with open(json_path, 'w') as f:
+                    json.dump(self.current_metrics, f, indent=4)
+                    
+            # 2. Nagy felbontású képek mentése
+            for suffix, item in plots_to_export.items():
+                exporter = pg.exporters.ImageExporter(item)
+                exporter.parameters()['width'] = 2000
+                filename = os.path.join(out_dir, f"{base_name}_{suffix}.png")
+                exporter.export(filename)
+                
+            QMessageBox.information(self, "Export Successful", f"Data and all 7 figures saved to:\n{out_dir}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to save data:\n{str(e)}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
