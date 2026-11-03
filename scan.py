@@ -108,9 +108,12 @@ class ScanWorker(QThread):
                 temp_files.append(tmp_file)
 
             self.log_signal.emit("Processing and averaging scans...")
+            # arrays: list of (H, W, 3) float32 tömbök
             arrays = [tifffile.imread(f).astype(np.float32) for f in temp_files]
-            avg_img = np.mean(arrays, axis=0)
+            stack = np.stack(arrays, axis=0) # Alak: (N, H, W, 3)
+            avg_img = np.mean(stack, axis=0)
             avg_img = np.clip(avg_img, 0, 65535)
+            std_img = np.std(stack, axis=0, ddof=1)
 
             # Pozíció lekérése a GUI beállításokból
             left_offset_mm = float(self.kwargs.get('left', 0.0))
@@ -118,13 +121,20 @@ class ScanWorker(QThread):
             # Metaadat string generálása
             metadata_str = f"left_mm={left_offset_mm};scanner_center_mm=108.0"
 
-            # DPI metaadat mentése a TIFF fájlba
+            # 1. Átlagolt TIFF mentése
             tifffile.imwrite(final_filename, 
                              avg_img.astype(np.uint16),
                              resolution=(dpi, dpi),
                              description=metadata_str)
+
+            # 2. Szóráskép mentése (lehet float32 TIFF vagy NumPy tömb)
+            std_filename = final_filename.replace(".tif", "_scan_std.tif")
+            tifffile.imwrite(std_filename,
+                             std_img.astype(np.float32),
+                             resolution=(dpi, dpi),
+                             description="Pixel-wise standard deviation across scan repetitions")
             
-            self.log_signal.emit(f"✔ Final TIFF saved (with {dpi} DPI tag): {os.path.basename(final_filename)}")
+            self.log_signal.emit(f"✔ Final TIFF & STD map saved: {os.path.basename(final_filename)}")
             self.finished_signal.emit(True, final_filename)
         except Exception as e:
             self.log_signal.emit(f"❌ Acquisition error: {e}")
