@@ -187,6 +187,12 @@ class FilmScannerDialog(QDialog):
         lay_dir.addWidget(self.txt_dir, 0, 1)
         lay_dir.addWidget(self.btn_browse, 0, 2)
 
+        lay_dir.addWidget(QLabel("Prefix:"), 1, 0)
+        self.txt_prefix = QLineEdit("film")
+        self.chk_date = QCheckBox("Append Date")
+        self.chk_date.setChecked(True)
+        
+        # --- Kezdő index beállító SpinBox ---
         self.lbl_idx = QLabel("Next Idx:")
         self.spin_next_idx = QSpinBox()
         self.spin_next_idx.setRange(1, 9999)
