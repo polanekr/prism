@@ -214,29 +214,56 @@ class GafchromicEngine:
     def run_calibration(self, calibration_folder: str, doses_gy: list, roi_size: int = 50, n_posterior_samples: int = 100):
         """
         Performs standard calibration using Scipy's curve_fit AND saves parameter covariance.
+        Uses _scan_std.tif for empirical noise weighting if available.
         """
         print(f"\n--- Running Standard Calibration: {calibration_folder} ---")
         folder = Path(calibration_folder)
         files = sorted(list(folder.glob("*.tif")))
+        # Kiszűrjük a _scan_std.tif fájlokat a fő listából
+        files = [f for f in files if not f.name.endswith("_scan_std.tif")]
         if len(files) == 0: raise ValueError("No .tif files found!")
         
+        # --- BLANK FILM ÉS ZAJ BETÖLTÉSE ---
         blank_img_raw, _ = self._load_tiff_with_meta(files[0])
         blank_img = median_filter(blank_img_raw, size=5)
         blank_roi_stats, _ = self._get_roi_stats(blank_img, size=roi_size)
         
+        blank_std_path = str(files[0]).replace(".tif", "_scan_std.tif")
+        has_std_files = os.path.exists(blank_std_path)
+        if has_std_files:
+            blank_std_img = tifffile.imread(blank_std_path).astype(np.float64)
+        else:
+            blank_std_img = np.zeros_like(blank_img_raw)
+        
         measured_ods = {'R': [], 'G': [], 'B': []}
         measured_sigs = {'R': [], 'G': [], 'B': []}
 
-        print("  -> Reading film data...")
+        print("  -> Reading film data and extracting ROI statistics...")
         for fpath in files:
             img_raw, _ = self._load_tiff_with_meta(fpath)
             img = median_filter(img_raw, size=3) 
             od_map = self._calculate_od_map(img, blank_img)
-            means, stds = self._get_roi_stats(od_map, size=roi_size)
+            
+            # Alapértelmezett térbeli szórás (ha nincs szkennerzaj fájl)
+            means_od, spatial_stds_od = self._get_roi_stats(od_map, size=roi_size)
+            
+            std_path = str(fpath).replace(".tif", "_scan_std.tif")
+            if has_std_files and os.path.exists(std_path):
+                img_std = tifffile.imread(std_path).astype(np.float64)
+                # Egzakt hibaterjedés a nyers I és blank I alapján
+                term_img = (img_std / (np.log(10) * np.maximum(img_raw, 1.0))) ** 2
+                term_blank = (blank_std_img / (np.log(10) * np.maximum(blank_img_raw, 1.0))) ** 2
+                od_noise_map = np.sqrt(term_img + term_blank)
+                
+                # A zajtérkép átlaga a ROI-ban adja a mérési bizonytalanságot
+                means_noise, _ = self._get_roi_stats(od_noise_map, size=roi_size)
+                stds_to_use = means_noise
+            else:
+                stds_to_use = spatial_stds_od
             
             for i, ch in enumerate(['R', 'G', 'B']):
-                measured_ods[ch].append(means[i])
-                measured_sigs[ch].append(stds[i])
+                measured_ods[ch].append(means_od[i])
+                measured_sigs[ch].append(stds_to_use[i])
 
         print("  -> Fitting curves & extracting covariance...")
         d_arr = np.array(doses_gy, dtype=np.float64)
@@ -270,6 +297,7 @@ class GafchromicEngine:
             bounds = ([-0.03, b_min, 0.5], [0.03, b_max, 500.0])
             
             try:
+                # curve_fit a valós mérési szórásokkal súlyoz (sigma=sigs)
                 popt3, pcov3 = curve_fit(
                     self.rational_func_od_3p, d_arr, ods, p0=p0, sigma=sigs, 
                     bounds=bounds, absolute_sigma=False, maxfev=15000
@@ -306,6 +334,7 @@ class GafchromicEngine:
             "blank_rgb": blank_roi_stats.tolist(),
             "doses_gy": doses_gy,
             "method": "Standard_CurveFit",
+            "noise_model": "empirical_scans" if has_std_files else "spatial_variance",
             "date": str(datetime.now())
         }
         out_path = os.path.join(self.output_folder, "calibration_master.json")
@@ -317,10 +346,8 @@ class GafchromicEngine:
                              draws: int = 3000, chains: int = 4, use_cleaning: bool = True,
                              n_saved_samples: int = 100):
         """
-        Kiterjesztett dózistartományú (0-50+ Gy) Bayes-i MCMC kalibráció:
-        - Fixálja a netOD(0) = 0 fizikai peremfeltételt (a = 0).
-        - Illeszti az 'e' görbületi kitevőt (a kék csatorna kis dózisú hűségéért).
-        - LogNormal priorokat használ, így SOHA nem lép fel HMC quadpotential overflow!
+        Kiterjesztett dózistartományú (0-50+ Gy) Bayes-i MCMC kalibráció.
+        Heteroszkedasztikus hibamodellt használ: sigma_total^2 = sigma_measured^2 + sigma_model^2
         """
         if not BAYES_AVAILABLE:
             print("  ERROR: PyMC is not available.")
@@ -329,14 +356,23 @@ class GafchromicEngine:
         print(f"\n--- Running Extended-Range MCMC Calibration: {calibration_folder} (Cleaning={use_cleaning}) ---")
         folder = Path(calibration_folder)
         files = sorted(list(folder.glob("*.tif")))
+        files = [f for f in files if not f.name.endswith("_scan_std.tif")]
         if len(files) == 0: raise ValueError("No .tif files found!")
 
-        print("  -> Loading images...")
+        print("  -> Loading images & empirical uncertainties...")
         blank_img_raw, _ = self._load_tiff_with_meta(files[0])
         blank_img = median_filter(blank_img_raw, size=5)
         blank_roi_stats, _ = self._get_roi_stats(blank_img, size=roi_size)
         
+        blank_std_path = str(files[0]).replace(".tif", "_scan_std.tif")
+        has_std_files = os.path.exists(blank_std_path)
+        if has_std_files:
+            blank_std_img = tifffile.imread(blank_std_path).astype(np.float64)
+        else:
+            blank_std_img = np.zeros_like(blank_img_raw)
+        
         measured_ods = {'R': [], 'G': [], 'B': []}
+        measured_sigs = {'R': [], 'G': [], 'B': []}
         
         for fpath in files:
             img_raw, _ = self._load_tiff_with_meta(fpath)
@@ -346,12 +382,25 @@ class GafchromicEngine:
             if use_cleaning:
                 od_map = self._clean_od_map_biharmonic(od_map)
             
-            means_od, _ = self._get_roi_stats(od_map, size=roi_size)
+            means_od, spatial_stds_od = self._get_roi_stats(od_map, size=roi_size)
+            
+            std_path = str(fpath).replace(".tif", "_scan_std.tif")
+            if has_std_files and os.path.exists(std_path):
+                img_std = tifffile.imread(std_path).astype(np.float64)
+                term_img = (img_std / (np.log(10) * np.maximum(img_raw, 1.0))) ** 2
+                term_blank = (blank_std_img / (np.log(10) * np.maximum(blank_img_raw, 1.0))) ** 2
+                od_noise_map = np.sqrt(term_img + term_blank)
+                
+                means_noise, _ = self._get_roi_stats(od_noise_map, size=roi_size)
+                stds_to_use = means_noise
+            else:
+                stds_to_use = spatial_stds_od
+                
             for i, ch in enumerate(['R', 'G', 'B']):
                 measured_ods[ch].append(means_od[i])
+                measured_sigs[ch].append(stds_to_use[i])
 
         d_arr = np.array(doses_gy, dtype=np.float64)
-        # Biztosítjuk, hogy a netOD a D=0 pontban pontosan 0-hoz legyen igazítva
         for ch in ['R', 'G', 'B']:
             od0 = measured_ods[ch][0] if d_arr[0] == 0 else 0.0
             measured_ods[ch] = [max(0.0, float(val - od0)) for val in measured_ods[ch]]
@@ -374,13 +423,13 @@ class GafchromicEngine:
 
         for ch in ['R', 'G', 'B']:
             od_data = np.array(measured_ods[ch], dtype=np.float64)
+            sig_meas = np.maximum(np.array(measured_sigs[ch], dtype=np.float64), 0.001)
             max_od = max(float(np.max(od_data)), 0.1)
             
-            # Kezdeti becslés a (b, c, e) paraméterekre (a = 0 fix!)
             try:
                 p0_guess = [max_od * 1.8, 12.0 if ch != 'B' else 35.0, 1.0 if ch != 'B' else 1.2]
                 popt, _ = curve_fit(
-                    hill_fit, d_arr, od_data, p0=p0_guess,
+                    hill_fit, d_arr, od_data, p0=p0_guess, sigma=sig_meas,
                     bounds=([max_od * 1.02, 0.5, 0.65], [15.0, 500.0, 1.6]),
                     maxfev=10000
                 )
@@ -389,20 +438,24 @@ class GafchromicEngine:
                 mu_b, mu_c, mu_e = max_od * 2.0, 15.0, 1.0
 
             with pm.Model() as model:
-                # LogNormal priorok: természetes módon > 0, végtelenül differenciálható, NINCS OVERFLOW!
+                # LogNormal priorok a fizikai paraméterekre
                 b = pm.LogNormal('b', mu=np.log(mu_b), sigma=0.35)
                 c = pm.LogNormal('c', mu=np.log(mu_c), sigma=0.45)
                 e = pm.LogNormal('e', mu=np.log(mu_e), sigma=0.15)
-                sigma = pm.HalfNormal('sigma', sigma=0.005)
+                
+                # A film inhomogenitásból eredő strukturális hiba
+                sigma_model = pm.HalfNormal('sigma_model', sigma=0.005)
                 
                 d_pos = np.maximum(d_arr, 1e-8)
                 de = d_pos ** e
-                # D=0-nál pontosan 0
                 mu_od = pm.math.switch(d_arr <= 0, 0.0, (b * de) / (de + c))
                 
-                pm.Normal('obs', mu=mu_od, sigma=sigma, observed=od_data)
+                # Teljes variancia = Mérési variancia (ismert) + Modell variancia (keresett)
+                sigma_tot = pm.math.sqrt(sig_meas**2 + sigma_model**2)
                 
-                init_vals = {'b': mu_b, 'c': mu_c, 'e': mu_e, 'sigma': 0.003}
+                pm.Normal('obs', mu=mu_od, sigma=sigma_tot, observed=od_data)
+                
+                init_vals = {'b': mu_b, 'c': mu_c, 'e': mu_e, 'sigma_model': 0.003}
                 trace = pm.sample(
                     draws=draws, tune=1000, chains=chains, cores=1, 
                     init='adapt_diag', target_accept=0.95, 
@@ -414,13 +467,14 @@ class GafchromicEngine:
                 b_s = post['b'].values.flatten()
                 c_s = post['c'].values.flatten()
                 e_s = post['e'].values.flatten()
-                sig_s = post['sigma'].values.flatten()
+                sig_model_s = post['sigma_model'].values.flatten()
                 a_s = np.zeros_like(b_s) # a = 0 fixen!
                 
                 self.calib_params[ch] = np.array([
                     0.0, np.median(b_s), np.median(c_s), np.median(e_s)
                 ])
-                self.calib_sigma_od[ch] = float(np.median(sig_s))
+                # Eltároljuk a strukturális (modell) bizonytalanságot
+                self.calib_sigma_od[ch] = float(np.median(sig_model_s))
                 
                 params_stack = np.vstack([a_s, b_s, c_s, e_s])
                 self.calib_cov[ch] = np.cov(params_stack)
@@ -445,6 +499,7 @@ class GafchromicEngine:
             "blank_rgb": blank_roi_stats.tolist(),
             "doses_gy": doses_gy,
             "method": "MCMC_LogNormal_Hill",
+            "noise_model": "empirical_scans_heteroscedastic" if has_std_files else "spatial_variance_homoscedastic",
             "date": str(datetime.now())
         }
         with open(os.path.join(self.output_folder, "calibration_master.json"), 'w') as f:
@@ -591,14 +646,25 @@ class GafchromicEngine:
         """
         Batch processes a list of film scans into dose maps (*_dose.npy) AND 
         pixel-wise uncertainty maps (*_std.npy).
+        Incorporates exact scanner noise propagation from _scan_std.tif if available.
         """
         if not self.calib_params: raise ValueError("No calibration loaded!")
         
         print(f"\n--- Processing {len(file_list)} films (Method={method}, Cleaning={use_cleaning}) ---")
         
+        # --- BLANK FILM ÉS ZAJÁNAK BETÖLTÉSE ---
         if blank_rgb is None:
             blank_img_raw, _ = self._load_tiff_with_meta(blank_path)
             blank_img = median_filter(blank_img_raw, size=5)
+            
+            blank_std_path = blank_path.replace(".tif", "_scan_std.tif")
+            if os.path.exists(blank_std_path):
+                print(f"  -> Blank scanner noise profile loaded: {os.path.basename(blank_std_path)}")
+                blank_std_img = tifffile.imread(blank_std_path).astype(np.float64)
+            else:
+                blank_std_img = np.zeros_like(blank_img_raw)
+        else:
+            blank_std_img = np.full((10, 10, 3), 10.0, dtype=np.float64)
         
         for idx, fpath in tqdm(enumerate(file_list), total=len(file_list)):
             fname = os.path.basename(fpath)
@@ -607,29 +673,48 @@ class GafchromicEngine:
             img_raw, meta = self._load_tiff_with_meta(fpath)
             img = median_filter(img_raw, size=3)
             
+            # --- BLANK FILM KÉP ÉS ZAJ SKÁLÁZÁSA (Ha eltér a méret) ---
             if blank_rgb is not None:
                 current_blank = np.ones_like(img) * np.array(blank_rgb)
+                current_blank_std = np.ones_like(img) * 10.0
             else:
                 if img.shape != blank_img.shape:
                     scale_h = img.shape[0] / blank_img.shape[0]
                     scale_w = img.shape[1] / blank_img.shape[1]
                     current_blank = zoom(blank_img, (scale_h, scale_w, 1.0), order=1)
+                    current_blank_std = zoom(blank_std_img, (scale_h, scale_w, 1.0), order=1)
                 else:
                     current_blank = blank_img
+                    current_blank_std = blank_std_img
             
             spacing = meta.get("pixel_spacing_mm", 0.0846)
             x_offset = meta.get("x_offset_mm", None)
             scanner_center = meta.get("scanner_center_mm", 108.0)
-            # Nyers és szűrt OD térkép a lokális scanner-zaj becsléséhez (LRA korrekcióval)
-            raw_od_map = self._calculate_od_map(img_raw, current_blank, spacing, x_offset, scanner_center)
+            
+            # 1. Alap OD térkép kiszámítása
             od_map = self._calculate_od_map(img, current_blank, spacing, x_offset, scanner_center)
             
             if use_cleaning:
                 od_map = self._clean_od_map_biharmonic(od_map)
                 
-            od_noise_map = self._estimate_od_noise_map(raw_od_map, od_map)
+            # --- ZAJ (sigma_OD) KISZÁMÍTÁSA ---
+            std_path = fpath.replace(".tif", "_scan_std.tif")
+            if os.path.exists(std_path):
+                # Egzakt szkennerzaj propagáció a scan_std.tif-ből
+                img_std = tifffile.imread(std_path).astype(np.float64)
+                
+                # Hibaterjedés: sigma_OD = (1 / (ln(10) * I)) * sigma_I
+                term_img = (img_std / (np.log(10) * np.maximum(img_raw, 1.0))) ** 2
+                term_blank = (current_blank_std / (np.log(10) * np.maximum(current_blank, 1.0))) ** 2
+                
+                od_noise_map = np.sqrt(term_img + term_blank)
+                od_noise_map = median_filter(od_noise_map, size=3) # Sima zajtérkép
+            else:
+                # Fallback: zajbecslés a szűretlen és szűrt OD különbségéből
+                raw_od_map = self._calculate_od_map(img_raw, current_blank, spacing, x_offset, scanner_center)
+                od_noise_map = self._estimate_od_noise_map(raw_od_map, od_map)
             
-            # 1. Dózis és illesztési/mérési szórás (std_fit) kiszámítása
+            # 2. Dózis és illesztési/mérési szórás (std_fit) kiszámítása
             if method == 'mayer':
                 dose_map, std_fit_map = self._solver_mayer(od_map, od_noise_map=od_noise_map)
             elif method == 'admm':
@@ -637,10 +722,10 @@ class GafchromicEngine:
             else:
                 dose_map, std_fit_map = self._solver_fast(od_map, od_noise_map=od_noise_map)
             
-            # 2. Kalibrációs görbe bizonytalanságának (std_calib) kiszámítása
+            # 3. Kalibrációs görbe bizonytalanságának (std_calib) kiszámítása
             std_calib_map = self._compute_calibration_std_map(od_map, dose_map)
             
-            # 3. Teljes pixelenkénti szórás kombinálása: sigma_tot = sqrt(sigma_fit^2 + sigma_calib^2)
+            # 4. Teljes pixelenkénti szórás kombinálása: sigma_tot = sqrt(sigma_fit^2 + sigma_calib^2)
             std_total_map = np.sqrt(std_fit_map**2 + std_calib_map**2)
             
             # Medián szűrés a kiugró egyedi pixelhibák simítására
@@ -668,7 +753,8 @@ class GafchromicEngine:
                 "mean_relative_uncertainty_pct": round(mean_rel_std, 2),
                 "unit": "Gy",
                 "method": method,
-                "cleaning_applied": use_cleaning
+                "cleaning_applied": use_cleaning,
+                "noise_model": "measured_from_scanner" if os.path.exists(std_path) else "estimated_from_image"
             }
             
             if self.batch_metadata:

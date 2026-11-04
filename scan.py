@@ -187,16 +187,19 @@ class FilmScannerDialog(QDialog):
         lay_dir.addWidget(self.txt_dir, 0, 1)
         lay_dir.addWidget(self.btn_browse, 0, 2)
 
-        lay_dir.addWidget(QLabel("Prefix:"), 1, 0)
-        self.txt_prefix = QLineEdit("film")
-        self.chk_date = QCheckBox("Append Date")
-        self.chk_date.setChecked(True)
+        self.lbl_idx = QLabel("Next Idx:")
+        self.spin_next_idx = QSpinBox()
+        self.spin_next_idx.setRange(1, 9999)
+        self.spin_next_idx.setValue(1)
+        
         self.btn_reset_idx = QPushButton("Reset Index")
         self.btn_reset_idx.clicked.connect(self.reset_index)
         
         hbox_name = QHBoxLayout()
         hbox_name.addWidget(self.txt_prefix)
         hbox_name.addWidget(self.chk_date)
+        hbox_name.addWidget(self.lbl_idx)
+        hbox_name.addWidget(self.spin_next_idx)
         hbox_name.addWidget(self.btn_reset_idx)
         lay_dir.addLayout(hbox_name, 1, 1, 1, 2)
         layout.addWidget(grp_dir)
