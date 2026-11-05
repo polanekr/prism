@@ -374,6 +374,20 @@ class BioDosimetryTab(QWidget):
             from pathlib import Path
             p = Path(path)
             dose_map = np.load(str(p)).astype(np.float32)
+
+            import json
+            meta_path = p.with_name(p.name.replace("_dose.npy", "_meta.json"))
+            if not meta_path.exists():
+                meta_path = p.with_name(p.stem.replace("_dose", "") + "_meta.json")
+                
+            if meta_path.exists():
+                try:
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f)
+                        if "pixel_spacing_mm" in meta:
+                            self.spacing = float(meta["pixel_spacing_mm"])
+                except Exception as e:
+                    print(f"Warning: Failed to load meta.json for spacing: {e}")
             
             # Robusztus std fájlkeresés több elnevezési sémára
             std_candidates = [
