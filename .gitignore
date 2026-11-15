@@ -1,3 +1,10 @@
 *.pyc
 *.pyo
 __pycache__/
+.venv/
+.wheel-venv/
+build/
+dist/
+*.egg-info/
+validation-results/
+benchmark-results/

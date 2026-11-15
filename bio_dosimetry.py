@@ -1,8 +1,11 @@
 import os
 import numpy as np
 import pyqtgraph as pg
-from scipy.ndimage import rotate, shift, gaussian_filter
 import csv
+from bio_analysis import SampleRegion, analyze_samples
+from processing_settings import BioSettings
+from background_tasks import TaskController
+from sample_statistics import axisymmetric_volume_weights
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel, 
@@ -143,16 +146,24 @@ class BioSampleGeometry:
 class BioDosimetryTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.film_paths = {}
         self.front_dose = None
         self.back_dose = None
         self.front_std = None
         self.back_std = None
         self.spacing = 0.0846  # Default 300 DPI mm/pixel
+        self.front_spacing = None
+        self.back_spacing = None
         self.rois = []
         self.results_data = {}
         self.geometry = BioSampleGeometry()
 
         
+        self.tasks = TaskController(self)
+        self.tasks.ready.connect(self._display_results)
+        self.tasks.failed.connect(self._calculation_error)
+        self.tasks.progress.connect(self._show_progress)
+        self.tasks.busy_changed.connect(self._set_calculation_busy)
         self._init_ui()
 
     def _init_ui(self):
@@ -229,6 +240,7 @@ class BioDosimetryTab(QWidget):
             spin.setSingleStep(0.5)
             spin.setValue(getattr(self.geometry, key))
             spin.valueChanged.connect(lambda val, k=key: setattr(self.geometry, k, val))
+            spin.valueChanged.connect(self._invalidate_results)
             self.spins[key] = spin
             geo_layout.addWidget(spin, i, 1)
         left_layout.addWidget(geo_group)
@@ -268,6 +280,10 @@ class BioDosimetryTab(QWidget):
         self.btn_calc.setStyleSheet("background-color: #2b8a3e; color: white; font-weight: bold;")
         self.btn_calc.clicked.connect(self.calculate_doses)
         toolbar.addWidget(self.btn_calc)
+        self.btn_cancel = QPushButton("Cancel Calculation")
+        self.btn_cancel.clicked.connect(self._invalidate_results)
+        self.btn_cancel.setEnabled(False)
+        self.lbl_progress = QLabel("")
         
         toolbar.addWidget(QLabel("<b>Overlay Blend:</b>"))
         self.sl_blend = QSlider(Qt.Horizontal)
@@ -277,6 +293,11 @@ class BioDosimetryTab(QWidget):
         toolbar.addWidget(self.sl_blend)
         
         mid_layout.addLayout(toolbar)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.btn_cancel)
+        self.lbl_progress.setWordWrap(True)
+        status_row.addWidget(self.lbl_progress, 1)
+        mid_layout.addLayout(status_row)
 
         self.glw = pg.GraphicsLayoutWidget()
         
@@ -326,7 +347,10 @@ class BioDosimetryTab(QWidget):
         right_layout = QVBoxLayout(right_panel)
         
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["ROI ID", "Mean [Gy]", "Spread [%]", "Uncert [%]", "Min [Gy]", "Max [Gy]"])
+        self.table.setHorizontalHeaderLabels(["ROI ID", "Mean [Gy]", "Spread [%]", "Mean pixel uncertainty [%]", "Min [Gy]", "Max [Gy]"])
+        self.table.horizontalHeaderItem(3).setToolTip(
+            'Volume-weighted mean pixel uncertainty bound / mean dose. '
+            'Unknown front/back correlation is treated conservatively; this is not uncertainty of the sample mean.')
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.itemSelectionChanged.connect(self.plot_selected_dvh)
         right_layout.addWidget(QLabel("<b>Sample Results:</b>"))
@@ -338,9 +362,15 @@ class BioDosimetryTab(QWidget):
         self.btn_export_table.clicked.connect(self.export_sample_table)
         right_layout.addWidget(self.btn_export_table)
 
-        self.btn_export = QPushButton("💾 Export 3D Volumetric Data (.npz)")
+        self.btn_export = QPushButton("💾 Export Sample Data (.npz)")
         self.btn_export.clicked.connect(self.export_numpy)
         right_layout.addWidget(self.btn_export)
+
+        self.combo_dvh_range = QComboBox()
+        self.combo_dvh_range.addItems(["Dose axis: sample range", "Dose axis: full, from 0 Gy"])
+        self.combo_dvh_range.setToolTip("Zoom to occupied dose bins. Bin volumes, statistics and exported data are unchanged.")
+        self.combo_dvh_range.currentIndexChanged.connect(self.plot_selected_dvh)
+        right_layout.addWidget(self.combo_dvh_range)
 
         # DVH Grafikon
         self.plot_dvh = pg.PlotWidget(title="Differential Dose-Volume Histogram (dDVH)")
@@ -365,8 +395,9 @@ class BioDosimetryTab(QWidget):
             self.img_front.setOpacity(val)
             self.img_back.setOpacity(1.0 - (val * 0.5))  # Back nem tűnik el teljesen
 
-    def load_film(self, target):
-        path, _ = QFileDialog.getOpenFileName(self, f"Load {target.upper()} Dose Map", "", "Numpy Arrays (*_dose.npy *.npy)")
+    def load_film(self, target, path=None, report_errors=True):
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, f"Load {target.upper()} Dose Map", "", "Numpy Arrays (*_dose.npy *.npy)")
         if not path:
             return
         
@@ -374,20 +405,23 @@ class BioDosimetryTab(QWidget):
             from pathlib import Path
             p = Path(path)
             dose_map = np.load(str(p)).astype(np.float32)
+            if (dose_map.ndim != 2 or 0 in dose_map.shape
+                    or not np.all(np.isfinite(dose_map)) or np.any(dose_map < 0)):
+                raise ValueError('Dose maps must be finite, nonnegative, nonempty 2D arrays.')
 
             import json
-            meta_path = p.with_name(p.name.replace("_dose.npy", "_meta.json"))
-            if not meta_path.exists():
-                meta_path = p.with_name(p.stem.replace("_dose", "") + "_meta.json")
-                
+            meta_path = p.with_name(p.stem.removesuffix('_dose') + '_meta.json')
+            meta = {}
+            spacing = 0.0846
             if meta_path.exists():
-                try:
-                    with open(meta_path, 'r') as f:
-                        meta = json.load(f)
-                        if "pixel_spacing_mm" in meta:
-                            self.spacing = float(meta["pixel_spacing_mm"])
-                except Exception as e:
-                    print(f"Warning: Failed to load meta.json for spacing: {e}")
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                spacing = float(meta.get('pixel_spacing_mm', spacing))
+            if not np.isfinite(spacing) or spacing <= 0:
+                raise ValueError('Pixel spacing must be finite and positive.')
+            other_spacing = self.back_spacing if target == 'front' else self.front_spacing
+            if other_spacing is not None and not np.isclose(spacing, other_spacing, rtol=1e-4, atol=0):
+                raise ValueError('Front and back pixel spacing must match. Resample the films before loading.')
             
             # Robusztus std fájlkeresés több elnevezési sémára
             std_candidates = [
@@ -400,6 +434,9 @@ class BioDosimetryTab(QWidget):
             for cand in std_candidates:
                 if cand.exists() and cand != p:
                     std_map = np.load(str(cand)).astype(np.float32)
+                    if (std_map.shape != dose_map.shape or not np.all(np.isfinite(std_map))
+                            or np.any(std_map < 0)):
+                        raise ValueError('The STD map must match the dose map and contain finite, nonnegative values.')
                     break
 
             # Peremhibák, nullák és a fals kiugró artefaktumok szűrése az ablakoláshoz
@@ -421,10 +458,13 @@ class BioDosimetryTab(QWidget):
             max_d = min(max_d, 60.0)
 
             std_status = "✓ std OK" if std_map is not None else "⚠ std missing (2% fallback)"
+            if std_map is not None and meta.get('calibration_uncertainty_available') is False:
+                std_status = '⚠ partial std (calibration uncertainty unavailable)'
 
             if target == 'front':
                 self.front_dose = dose_map
                 self.front_std = std_map
+                self.front_spacing = spacing
                 self.img_front.setImage(dose_map, autoLevels=False)
                 self.hist_front.setLevels(min_d, max_d)
                 self.hist_front.setHistogramRange(min_d, max_d, padding=0.05)
@@ -438,6 +478,7 @@ class BioDosimetryTab(QWidget):
             else:
                 self.back_dose = dose_map
                 self.back_std = std_map
+                self.back_spacing = spacing
                 self.img_back.setImage(dose_map, autoLevels=False)
                 self.hist_back.setLevels(min_d, max_d)
                 self.hist_back.setHistogramRange(min_d, max_d, padding=0.05)
@@ -446,13 +487,21 @@ class BioDosimetryTab(QWidget):
                 self.lbl_back.setText(f"Back: {p.name} [{std_status}]")
                 self.lbl_back.setStyleSheet("color: green; font-weight: bold;")
                 
+            if self.spacing != spacing:
+                self.clear_all_rois()
+            self.spacing = spacing
+            self.update_alignment()
             self.plot.autoRange()
+            self.film_paths[target] = p.resolve()
+            return True
             
         except Exception as e:
+            if not report_errors: raise
             QMessageBox.critical(self, "Error", f"Failed to load map:\n{e}")
 
     def update_alignment(self):
         """Hardver-gyorsított PyQtGraph vizuális igazítás (számolás nélkül)."""
+        self._invalidate_results()
         if self.front_dose is None: return
         dx = self.sl_shift_x.value()
         dy = self.sl_shift_y.value()
@@ -460,6 +509,25 @@ class BioDosimetryTab(QWidget):
         
         self.img_front.setPos(dx, dy)
         self.img_front.setRotation(rot_deg)
+
+    def _invalidate_results(self):
+        self.tasks.cancel()
+        self.lbl_progress.setText("Cancellation requested" if self.tasks.busy else "")
+        self.results_data.clear()
+        self.table.setRowCount(0)
+        self.curve_dvh.clear()
+        self.plot_dvh.setTitle('Differential Dose-Volume Histogram (dDVH)')
+
+    def _front_to_back_transform(self):
+        """Derive the numerical transform from the actual displayed image items."""
+        origin = self.img_front.mapToItem(self.img_back, QPointF(0, 0))
+        x_axis = self.img_front.mapToItem(self.img_back, QPointF(1, 0))
+        y_axis = self.img_front.mapToItem(self.img_back, QPointF(0, 1))
+        return np.array([
+            [x_axis.x() - origin.x(), y_axis.x() - origin.x(), origin.x()],
+            [x_axis.y() - origin.y(), y_axis.y() - origin.y(), origin.y()],
+            [0.0, 0.0, 1.0],
+        ])
 
     def reset_alignment(self):
         self.sl_shift_x.setValue(0)
@@ -500,8 +568,11 @@ class BioDosimetryTab(QWidget):
             roi = pg.PolyLineROI(poly_pts, closed=True, pen=pg.mkPen('#ff00ff', width=2))
             lbl_color = '#ff00ff'
 
+        roi.project_kind = self.combo_roi_type.currentIndex()
         self.plot.addItem(roi)
         self.rois.append(roi)
+        roi.sigRegionChanged.connect(self._invalidate_results)
+        self._invalidate_results()
         
         # Címke elhelyezése
         text = pg.TextItem(f"#{len(self.rois)}", color=lbl_color, anchor=(0, 1))
@@ -511,9 +582,7 @@ class BioDosimetryTab(QWidget):
         for roi in self.rois:
             self.plot.removeItem(roi)
         self.rois.clear()
-        self.table.setRowCount(0)
-        self.results_data.clear()
-        self.curve_dvh.setData([], [])
+        self._invalidate_results()
 
     def calculate_doses(self):
         if self.front_dose is None or self.back_dose is None:
@@ -523,167 +592,80 @@ class BioDosimetryTab(QWidget):
             QMessageBox.warning(self, "Error", "Add at least one ROI!")
             return
 
-        # 1. Regisztráció (Forgatás a kép közepe körül, majd eltolás)
-        dx = self.sl_shift_x.value()
-        dy = self.sl_shift_y.value()
-        rot_deg = self.sl_rot.value() / 10.0
-        
-        h, w = self.back_dose.shape
-        cy, cx = h / 2.0, w / 2.0
-        
-        from scipy.ndimage import affine_transform
-        theta = np.radians(-rot_deg)
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
-        
-        transform_matrix = np.array([
-            [cos_t, -sin_t],
-            [sin_t,  cos_t]
-        ])
-        
-        offset_y = cy - (cy * cos_t - cx * sin_t) - dy
-        offset_x = cx - (cy * sin_t + cx * cos_t) - dx
-        
-        front_aligned = affine_transform(self.front_dose, transform_matrix, offset=(offset_y, offset_x), order=1, mode='nearest')[:h, :w]
-        
-        if self.front_std is not None:
-            front_std_aligned = affine_transform(self.front_std, transform_matrix, offset=(offset_y, offset_x), order=1, mode='nearest')[:h, :w]
-        else:
-            front_std_aligned = front_aligned * 0.02
-
-        back_std_map = self.back_std if self.back_std is not None else self.back_dose * 0.02
-        w_back, scatter_sigma_mm = self.geometry.get_weights_and_scattering()
-        
-        d_front_safe = np.clip(front_aligned, 1e-4, None)
-        d_back_safe = np.clip(self.back_dose, 1e-4, None)
-        d_sample_map = (d_front_safe ** (1.0 - w_back)) * (d_back_safe ** w_back)
-        
-        term_f = ((1.0 - w_back) * (d_sample_map / d_front_safe) * front_std_aligned) ** 2
-        term_b = (w_back * (d_sample_map / d_back_safe) * back_std_map) ** 2
-        sigma_sample_map = np.sqrt(term_f + term_b)
-
-        from scipy.ndimage import gaussian_filter
-        if scatter_sigma_mm > 0:
-            sigma_px = scatter_sigma_mm / self.spacing
-            d_sample_map = gaussian_filter(d_sample_map, sigma=sigma_px)
-            sigma_sample_map = gaussian_filter(sigma_sample_map, sigma=sigma_px)
-
-        # Táblázat és adatok alaphelyzetbe állítása
-        self.table.setRowCount(0)
-        self.results_data.clear()
-        
-        from matplotlib.path import Path as MplPath
-        
-        for i, roi in enumerate(self.rois):
-            roi_id = i + 1
-            roi_data = roi.getArrayRegion(d_sample_map, self.img_back)
-            roi_sigma = roi.getArrayRegion(sigma_sample_map, self.img_back)
-            if roi_data is None or roi_data.size == 0:
-                continue
-
-            rh, rw = roi_data.shape
-            y_idx, x_idx = np.indices((rh, rw))
-            w_vol = np.ones_like(roi_data) 
-            
-            # Maszk és 3D súlyozás generálása
-            if isinstance(roi, EppendorfROI):
-                mask = roi.get_mask((rh, rw))
-                dims = {"0.5 ml": (5.5, 6.0, 3.5), "1.5 ml": (8.8, 8.0, 5.0), "2.0 ml": (9.2, 9.0, 4.5)}
-                w_mm, h_mm, cone_h_mm = dims.get(roi.tube_type, (8.8, 8.0, 5.0))
-                r_max_px = (w_mm / 2.0) / self.spacing
-                cone_h_px = cone_h_mm / self.spacing
-                
-                cone_start_y = rh - cone_h_px
-                r_y = np.where(
-                    y_idx < cone_start_y,
-                    r_max_px,
-                    np.maximum(0.1, r_max_px * (1.0 - (y_idx - cone_start_y) / cone_h_px))
-                )
-                
-                x_0 = rw / 2.0
-                rad_diff = np.maximum(0.0, r_y**2 - (x_idx - x_0)**2)
-                w_vol = 2.0 * np.sqrt(rad_diff)
-                
-            elif isinstance(roi, pg.EllipseROI):
-                mask = ((y_idx - rh / 2.0)**2 / (rh / 2.0)**2 + (x_idx - rw / 2.0)**2 / (rw / 2.0)**2) <= 1.0
+        self._invalidate_results()
+        regions = []
+        for identifier, roi in enumerate(self.rois, start=1):
+            shape, vectors, origin = roi.getAffineSliceParams(self.back_dose, self.img_back,
+                fromBoundingRect=isinstance(roi, pg.PolyLineROI))
+            shape_int = tuple(int(np.ceil(value)) for value in shape)
+            if min(shape_int) <= 0:
+                mask = np.zeros(shape_int, dtype=bool); weights = np.zeros(shape_int)
+            elif isinstance(roi, EppendorfROI):
+                mask = roi.get_mask(shape_int); weights = axisymmetric_volume_weights(mask)
             else:
-                handles = roi.getHandles()
-                h_coords = [roi.mapToParent(h.pos()) for h in handles]
-                bounding_pos = roi.mapToParent(pg.Point(0, 0))
-                poly_local = [[p.x() - bounding_pos.x(), p.y() - bounding_pos.y()] for p in h_coords]
-                pix_coords = np.vstack([x_idx.ravel(), y_idx.ravel()]).T
-                poly_path = MplPath(poly_local)
-                mask = poly_path.contains_points(pix_coords).reshape((rh, rw))
+                mask = roi.renderShapeMask(shape_int[1], shape_int[0]).T > .5
+                weights = np.ones(shape_int)
+            mask.setflags(write=False); weights.setflags(write=False)
+            regions.append(SampleRegion(identifier, tuple(shape), tuple(tuple(v) for v in vectors),
+                                        tuple(origin), mask, weights))
+        def snapshot(value):
+            if value is None: return None
+            result = np.array(value, copy=True); result.setflags(write=False); return result
+        front, back, front_std, back_std = map(snapshot, (self.front_dose, self.back_dose, self.front_std, self.back_std))
+        transform = self._front_to_back_transform()
+        weight, scattering = self.geometry.get_weights_and_scattering()
+        settings = BioSettings(weight, scattering, self.spacing)
+        regions = tuple(regions)
+        self.tasks.submit(lambda check, progress: analyze_samples(front, back, front_std, back_std,
+                            transform, settings, regions, check, progress))
 
-            valid_pixels = roi_data[mask]
-            valid_sigmas = roi_sigma[mask]
-            valid_weights = w_vol[mask]
-            
-            active_mask = valid_pixels > 0.001
-            active_pixels = valid_pixels[active_mask]
-            active_sigmas = valid_sigmas[active_mask]
-            active_weights = valid_weights[active_mask]
-            
-            if active_pixels.size == 0:
-                continue
-                
-            # Súlyozott átlag, szórás és DVH kiszámítása
-            w_sum = np.sum(active_weights)
-            mean_d = float(np.sum(active_pixels * active_weights) / w_sum) if w_sum > 0 else 0.0
-            variance_d = float(np.sum(active_weights * (active_pixels - mean_d)**2) / w_sum) if w_sum > 0 else 0.0
-            spread_d = np.sqrt(variance_d)
-            mean_uncert = float(np.sum(active_sigmas * active_weights) / w_sum) if w_sum > 0 else 0.0
-            
-            min_d = float(np.min(active_pixels))
-            max_d = float(np.max(active_pixels))
-            
-            spread_pct = (spread_d / mean_d * 100.0) if mean_d > 0 else 0.0
-            uncert_pct = float(np.mean(active_sigmas / active_pixels) * 100.0)
-            
-            y_raw, x_edges = np.histogram(active_pixels, bins=50, weights=active_weights)
-            y_norm = (y_raw / np.max(y_raw) * 100.0) if np.max(y_raw) > 0 else y_raw
-            bin_centers = (x_edges[:-1] + x_edges[1:]) / 2.0
-            bin_stds = np.full_like(bin_centers, mean_uncert)
-            dose_stats_matrix = np.vstack([bin_centers, bin_stds])
+    def _show_progress(self, message): self.lbl_progress.setText(message)
 
-            # Adatok mentése
-            self.results_data[roi_id] = {
-                'hist_x': bin_centers,
-                'hist_edges': x_edges,
-                'hist_y': y_norm,
-                'dose_stats': dose_stats_matrix,
-                'weights': active_weights,
-                'raw_voxels': active_pixels,
-                'raw_sigmas': active_sigmas,
-                'mean_dose': mean_d,
-                'spread_dose': spread_d,
-                'uncert_dose': mean_uncert,
-                'min_dose': min_d,
-                'max_dose': max_d,
-                'z_weight_back': w_back
-            }
-            
-            # Táblázat UI frissítése
+    def _set_calculation_busy(self, busy):
+        self.btn_calc.setEnabled(not busy)
+        self.btn_cancel.setEnabled(busy)
+        if not busy: self.lbl_progress.setText("")
+
+    def _calculation_error(self, error):
+        QMessageBox.warning(self, 'Sample calculation failed', error)
+
+    def _display_results(self, payload):
+        results = payload['results']; skipped = payload['skipped']
+        # Publish only after every nonempty sample has passed validation.
+        self.results_data = results
+        for roi_id, data in results.items():
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(f"Sample #{roi_id}"))
-            self.table.setItem(row, 1, QTableWidgetItem(f"{mean_d:.2f}"))
-            self.table.setItem(row, 2, QTableWidgetItem(f"{spread_pct:.1f}"))
-            self.table.setItem(row, 3, QTableWidgetItem(f"{uncert_pct:.1f}"))
-            self.table.setItem(row, 4, QTableWidgetItem(f"{min_d:.2f}"))
-            self.table.setItem(row, 5, QTableWidgetItem(f"{max_d:.2f}"))
+            values = [f'Sample #{roi_id}', f"{data['mean_dose']:.2f}",
+                      self._format_percentage(data['spread_pct']),
+                      self._format_percentage(data['uncert_pct']),
+                      f"{data['min_dose']:.2f}", f"{data['max_dose']:.2f}"]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if col == 0:
+                    item.setData(Qt.UserRole, roi_id)
+                self.table.setItem(row, col, item)
 
-        if self.table.rowCount() > 0:
-            self.table.selectRow(0)
-            self.plot_selected_dvh()
-            
-        QMessageBox.information(self, "Success", "Calculations and dDVH extraction complete!")
+        self.table.selectRow(0)
+        self.plot_selected_dvh()
+        message = 'Calculations and dDVH extraction complete!'
+        if skipped:
+            message += '\nEmpty ROIs skipped: ' + ', '.join(f'#{roi_id}' for roi_id in skipped)
+        QMessageBox.information(self, 'Success', message)
+
+    @staticmethod
+    def _format_percentage(value):
+        return f'{value:.1f}' if value is not None else 'N/A'
 
     def plot_selected_dvh(self):
         selected = self.table.selectedItems()
         if not selected:
+            self.curve_dvh.clear()
             return
         row = selected[0].row()
-        roi_id = row + 1
+        item = self.table.item(row, 0)
+        roi_id = item.data(Qt.UserRole) if item is not None else None
         
         data = self.results_data.get(roi_id)
         if data:
@@ -694,24 +676,42 @@ class BioDosimetryTab(QWidget):
                 # A stepMode="center" esetén len(x) == len(y) + 1 feltétel szükséges
                 self.curve_dvh.setData(x=x_edges, y=y, stepMode="center")
                 self.plot_dvh.setTitle(f"Sample #{roi_id} dDVH (Mean: {data['mean_dose']:.2f} Gy)")
-                self.plot_dvh.enableAutoRange()
+                if self.combo_dvh_range.currentIndex() == 0:
+                    occupied = np.flatnonzero(np.asarray(y) > 0)
+                    first, last = (occupied[0], occupied[-1]+1) if occupied.size else (0, len(x_edges)-1)
+                    lower, upper = float(x_edges[first]), float(x_edges[last])
+                else:
+                    lower, upper = 0., float(x_edges[-1])
+                self.plot_dvh.setXRange(lower, upper, padding=.04)
+                self.plot_dvh.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
 
     def export_numpy(self):
         if not self.results_data:
             QMessageBox.warning(self, "Error", "No calculated data to export!")
             return
             
-        path, _ = QFileDialog.getSaveFileName(self, "Save Volumetric Data to NPZ", "biological_samples_data.npz", "Numpy Archives (*.npz)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Sample Data to NPZ", "biological_samples_data.npz", "Numpy Archives (*.npz)")
         if not path: return
         
         try:
-            export_dict = {}
+            export_dict = {
+                'format_version': np.array(2),
+                'stat_names': np.array(['mean_dose_gy', 'spatial_std_gy', 'mean_pixel_sigma_gy',
+                                        'min_dose_gy', 'max_dose_gy']),
+                'dose_stats_rows': np.array(['dose_bin_center_gy', 'mean_pixel_sigma_gy']),
+                'uncertainty_definition': np.array(
+                    'Volume-weighted mean pixel uncertainty bound; unknown front/back correlation; '
+                    'not uncertainty of the sample mean.'),
+            }
             for roi_id, data in self.results_data.items():
                 prefix = f"sample_{roi_id}_"
                 export_dict[prefix + 'raw_voxels'] = data['raw_voxels']
                 export_dict[prefix + 'raw_sigmas'] = data['raw_sigmas']
                 export_dict[prefix + 'dose_stats'] = data['dose_stats']
                 export_dict[prefix + 'weights'] = data['weights']
+                export_dict[prefix + 'hist_edges'] = data['hist_edges']
+                export_dict[prefix + 'hist_volume_pct'] = data['hist_y']
+                export_dict[prefix + 'z_weight_back'] = np.array(data['z_weight_back'])
                 export_dict[prefix + 'stats'] = np.array([
                     data['mean_dose'], data['spread_dose'], data['uncert_dose'], data['min_dose'], data['max_dose']
                 ])
@@ -730,15 +730,17 @@ class BioDosimetryTab(QWidget):
         if not path: return
         
         try:
-            with open(path, mode='w', newline='') as file:
+            with open(path, mode='w', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file)
                 for roi_id, data in self.results_data.items():
                     writer.writerow([f"--- SAMPLE #{roi_id} ---"])
-                    writer.writerow(["Dose Bin [Gy]", "Relative Volume [%]"])
+                    writer.writerow(["Dose Bin [Gy]", "Relative Volume [%]",
+                                     "Bin Lower [Gy]", "Bin Upper [Gy]"])
                     x_centers = data['hist_x']
                     y = data['hist_y']
-                    for d, vol in zip(x_centers, y):
-                        writer.writerow([f"{d:.3f}", f"{vol:.1f}"])
+                    edges = data['hist_edges']
+                    for d, vol, lower, upper in zip(x_centers, y, edges[:-1], edges[1:]):
+                        writer.writerow([float(d), float(vol), float(lower), float(upper)])
                     writer.writerow([])
             QMessageBox.information(self, "Exported", f"Data saved to {path}")
         except Exception as e:
@@ -774,23 +776,29 @@ class BioDosimetryTab(QWidget):
             # Sorok adatai
             rows = []
             for r in range(row_count):
-                row_vals = []
-                for c in range(col_count):
-                    it = self.table.item(r, c)
-                    txt = it.text() if it else ""
-                    try:
-                        val = float(txt)
-                    except ValueError:
-                        val = txt
-                    row_vals.append(val)
-                rows.append(row_vals)
+                roi_id = self.table.item(r, 0).data(Qt.UserRole)
+                data = self.results_data[roi_id]
+                rows.append([f'Sample #{roi_id}', data['mean_dose'],
+                             data['spread_pct'] if data['spread_pct'] is not None else 'N/A',
+                             data['uncert_pct'] if data['uncert_pct'] is not None else 'N/A',
+                             data['min_dose'], data['max_dose']])
 
             if file_path.endswith('.xlsx') or "Excel" in selected_filter:
-                import pandas as pd
+                try:
+                    from openpyxl import Workbook
+                except ImportError:
+                    QMessageBox.warning(self, 'Excel support unavailable',
+                                        'Install optional Excel support with: uv sync --locked --extra excel. '
+                                        'CSV export is available without it.')
+                    return
                 if not file_path.endswith('.xlsx'):
                     file_path += '.xlsx'
-                df = pd.DataFrame(rows, columns=headers)
-                df.to_excel(file_path, index=False)
+                workbook = Workbook(write_only=True)
+                sheet = workbook.create_sheet('Sample metrics')
+                sheet.append(headers)
+                for row in rows:
+                    sheet.append(row)
+                workbook.save(file_path)
             else:
                 import csv
                 if not file_path.endswith('.csv'):

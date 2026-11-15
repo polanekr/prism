@@ -1,0 +1,61 @@
+name: Windows and Linux installation
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.13', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: '0.12.1'
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --python ${{ matrix.python }}
+      - run: uv run --no-sync prism --check
+      - if: runner.os == 'Windows'
+        run: .\start.bat --check
+      - if: runner.os == 'Linux'
+        run: ./start.sh --check
+      - run: uv run --no-sync python run_tests.py
+      - run: uv run --no-sync python -m benchmark --output benchmark-results/ci --sizes 12 --samples 2 --repeats 1
+  full:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: '0.12.1'
+          python-version: '3.13'
+      - run: uv sync --locked --all-extras --python 3.13
+      - run: uv run --no-sync prism --check --require-bayes --require-excel
+      - run: uv run --no-sync python run_tests.py
+      - run: uv run --no-sync prism --validate --quick --validation-output validation-ci
+      - run: uv build
+      - name: Install the built wheel into a fresh environment
+        run: |
+          uv venv --python 3.13 .wheel-venv
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            wheel_python="$GITHUB_WORKSPACE/.wheel-venv/Scripts/python.exe"
+          else
+            wheel_python="$GITHUB_WORKSPACE/.wheel-venv/bin/python"
+          fi
+          wheel=(dist/*.whl)
+          uv pip install --python "$wheel_python" "${wheel[0]}[bayes,excel]"
+          cd "$RUNNER_TEMP"
+          "$wheel_python" -m prism_app --check --require-bayes --require-excel
+          "$wheel_python" -m prism_app --validate --quick --validation-output "$RUNNER_TEMP/prism-wheel-validation"

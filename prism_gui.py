@@ -14,9 +14,10 @@ from PyQt5.QtWidgets import (
     QComboBox, QCheckBox, QLineEdit, QGroupBox, QTabWidget, 
     QSplitter, QMessageBox, QProgressBar, QAbstractItemView,
     QDialog, QDialogButtonBox, QSlider, QSpinBox, QGraphicsPathItem,
-    QTextEdit, QScrollArea, QFrame
+    QTextEdit, QScrollArea, QFrame, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from processing_settings import ProcessingSettings
 from PyQt5.QtGui import QImage, QPainter, QPageSize, QPdfWriter, QPainterPath
 from matplotlib.figure import Figure
 from scipy.ndimage import gaussian_filter, map_coordinates
@@ -25,7 +26,9 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 os.environ["PYQTGRAPH_QT_LIB"] = "PyQt5"
 import pyqtgraph as pg
 import pyqtgraph.exporters
-from dosimetry import GafchromicEngine, BAYES_AVAILABLE, BeamMorphology
+from dosimetry import GafchromicEngine, BAYES_AVAILABLE
+from uncertainty import mean_sigma_bound, cumulative_area, dose_distribution_bounds, beam_dose_distribution
+from scan_data import is_raw_film, scan_paths, ensure_scan_ready
 from bio_dosimetry import BioDosimetryTab
 pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
 
@@ -81,6 +84,7 @@ class BlankRoiDialog(QDialog):
         layout.addWidget(self.glw)
 
         try:
+            ensure_scan_ready(self.blank_path)
             raw_img = tifffile.imread(str(self.blank_path))
             if raw_img.ndim == 3 and raw_img.shape[2] > 3:
                 raw_img = raw_img[:, :, :3]
@@ -153,13 +157,16 @@ class EngineWorker(QThread):
                 cleaning = self.kwargs.get('cleaning', False)
                 orig_out = self.engine.output_folder
                 self.engine.output_folder = folder
-                if method == 'mcmc':
-                    if not BAYES_AVAILABLE:
-                        raise RuntimeError("PyMC/ArviZ packages are not available for MCMC calibration!")
-                    self.engine.run_mcmc_calibration(folder, doses, use_cleaning=cleaning)
-                else:
-                    self.engine.run_calibration(folder, doses)
-                self.engine.output_folder = orig_out
+                try:
+                    if method == 'mcmc':
+                        if not BAYES_AVAILABLE:
+                            raise RuntimeError("PyMC/ArviZ packages are not available for MCMC calibration!")
+                        self.engine.run_mcmc_calibration(folder, doses, use_cleaning=cleaning,
+                            adaptation=self.kwargs.get('mcmc_adaptation', 'adapt_diag'))
+                    else:
+                        self.engine.run_calibration(folder, doses)
+                finally:
+                    self.engine.output_folder = orig_out
                 self.finished.emit("Calibration completed successfully!")
 
             elif self.task_type == 'process':
@@ -168,7 +175,12 @@ class EngineWorker(QThread):
                 method = self.kwargs.get('method')
                 cleaning = self.kwargs.get('cleaning')
                 blank_rgb = self.kwargs.get('blank_rgb')
-                self.engine.process_films(files, blank, method=method, use_cleaning=cleaning, blank_rgb=blank_rgb)
+                specification = self.kwargs.get('settings') or ProcessingSettings(method=method,
+                    cleaning=bool(cleaning), blank_rgb=blank_rgb,
+                    median_filtering=self.kwargs.get('median_filtering', True), random_seed=self.engine.random_seed)
+                self.engine.process_films(files, blank, method=specification.method,
+                    use_cleaning=specification.cleaning, blank_rgb=specification.blank_rgb,
+                    median_filtering=specification.median_filtering, settings=specification)
                 self.finished.emit(f"Successfully converted {len(files)} film(s) to dose maps!")
                 
         except Exception as e:
@@ -185,7 +197,8 @@ class PrismDosimetryGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PRISM - Particle Beam & LWFA Dosimetry Suite")
-        self.resize(1720, 980)
+        available = self.screen().availableGeometry()
+        self.resize(min(1720, int(available.width()*.96)), min(980, int(available.height()*.94)))
 
         self.project_dir = None
         self.raw_dir = None
@@ -203,6 +216,9 @@ class PrismDosimetryGUI(QMainWindow):
         self.global_blank_std = None
         self.isocurves = []
         self.is_white_mode = False
+        self._display_map_mode = 'dose'
+        self._map_display_states = {}
+        self._updating_map_view = False
 
         self.pen_prof_x = pg.mkPen('y', width=3.0)
         self.pen_prof_y = pg.mkPen('c', width=3.0)
@@ -214,22 +230,33 @@ class PrismDosimetryGUI(QMainWindow):
         sys.stdout = EmittingStream(textWritten=self.normalOutputWritten)
         sys.stderr = EmittingStream(textWritten=self.normalOutputWritten)
 
+    def closeEvent(self, event):
+        from background_tasks import running_jobs, cancel_all
+        self.morphology_tab.invalidate_analysis(); self.bio_tab.tasks.cancel()
+        if running_jobs() or (hasattr(self, 'worker') and self.worker.isRunning()):
+            cancel_all(); event.ignore()
+            QTimer.singleShot(50, self.close)
+            return
+        super().closeEvent(event)
+
     def _init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = self.workspace_splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
         
-        scroll_area = QScrollArea()
+        scroll_area = self.control_scroll = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setMinimumWidth(380)
+        scroll_area.setMinimumWidth(260)
         
         control_panel = self._create_control_panel()
         scroll_area.setWidget(control_panel)
         splitter.addWidget(scroll_area)
         
         self.tabs = QTabWidget()
+        self.tabs.setMinimumWidth(0)
+        self.tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         splitter.addWidget(self.tabs)
         
         self.viewer_tab = self._create_viewer_tab()
@@ -242,6 +269,8 @@ class PrismDosimetryGUI(QMainWindow):
         self.tabs.addTab(self._create_placeholder_tab("RCF Stack & Depth-Dose Bragg Curve", "WIP"), "🧱 RCF Stack Analyzer (WIP)")
         
         splitter.setSizes([380, 1340])
+        from viewer_layout import ViewerLayout
+        self.viewer_layout = ViewerLayout(self)
 
     def _create_control_panel(self):
         panel = QWidget()
@@ -251,6 +280,8 @@ class PrismDosimetryGUI(QMainWindow):
         proj_group = QGroupBox("1. Project Session")
         proj_layout = QVBoxLayout(proj_group)
         self.btn_new_proj_scan = QPushButton("🆕 New Project & Open Scanner")
+        if sys.platform == 'win32':
+            self.btn_new_proj_scan.setText('🆕 New Project (Import 16-bit TIFFs)')
         self.btn_new_proj_scan.setStyleSheet("font-weight: bold; background-color: #2b8a3e; color: white;")
         self.btn_new_proj_scan.clicked.connect(self.create_project_and_launch_scanner)
         proj_layout.addWidget(self.btn_new_proj_scan)
@@ -266,6 +297,12 @@ class PrismDosimetryGUI(QMainWindow):
         self.lbl_proj_path = QLabel("No project selected")
         self.lbl_proj_path.setStyleSheet("color: gray; font-size: 11px;")
         proj_layout.addWidget(self.lbl_proj_path)
+        self.btn_save_state = QPushButton("Save Project State")
+        self.btn_save_state.clicked.connect(self.save_project_state)
+        self.btn_restore_state = QPushButton("Restore Project State")
+        self.btn_restore_state.clicked.connect(self.restore_project_state)
+        proj_layout.addWidget(self.btn_save_state)
+        proj_layout.addWidget(self.btn_restore_state)
         layout.addWidget(proj_group)
 
         # 2. Calibration
@@ -283,10 +320,19 @@ class PrismDosimetryGUI(QMainWindow):
         hbox_cal_opt = QHBoxLayout()
         self.combo_calib_method = QComboBox()
         self.combo_calib_method.addItems(["Standard (Curve Fit)", "Bayesian (MCMC)"])
+        if not BAYES_AVAILABLE:
+            self.combo_calib_method.model().item(1).setEnabled(False)
+            self.combo_calib_method.setToolTip('MCMC is optional. Install it with: uv sync --locked --extra bayes')
         self.chk_calib_clean = QCheckBox("bFDR cleaning")
         hbox_cal_opt.addWidget(self.combo_calib_method)
         hbox_cal_opt.addWidget(self.chk_calib_clean)
         calib_layout.addLayout(hbox_cal_opt)
+        calib_layout.addWidget(QLabel("MCMC adaptation:"))
+        self.combo_mcmc_adaptation = QComboBox()
+        self.combo_mcmc_adaptation.addItem("Diagonal (current)", "adapt_diag")
+        self.combo_mcmc_adaptation.addItem("Full covariance (experimental)", "adapt_full")
+        self.combo_mcmc_adaptation.setToolTip("Same posterior and sample count. PyMC labels full covariance adaptation experimental; inspect R-hat, ESS and divergences.")
+        calib_layout.addWidget(self.combo_mcmc_adaptation)
         hbox_cal_btns = QHBoxLayout()
         self.btn_run_calib = QPushButton("⚙️ Run Calibration")
         self.btn_run_calib.clicked.connect(self.run_new_calibration)
@@ -318,12 +364,28 @@ class PrismDosimetryGUI(QMainWindow):
 
         conv_layout.addWidget(QLabel("Solver method:"))
         self.combo_solver = QComboBox()
-        self.combo_solver.addItems(["mayer (Closed-form Bayesian 3-ch, 0-50 Gy)",
+        self.combo_solver.addItems(["mayer (Regularized multichannel thickness correction)",
             "fast (Vectorized 2-ch, fast)", 
             "admm (Total Variation + L2 Thickness Optimization)"])
         self.chk_conv_clean = QCheckBox("Apply bFDR artifact removal")
         conv_layout.addWidget(self.combo_solver)
         conv_layout.addWidget(self.chk_conv_clean)
+        self.chk_median_filter = QCheckBox("Apply spatial median filters")
+        self.chk_median_filter.setChecked(True)
+        self.chk_median_filter.setToolTip("May suppress narrow peaks. Blank 5×5, RGB 3×3, dose 3×3. Independent of bFDR; ADMM regularization remains solver-specific.")
+        conv_layout.addWidget(self.chk_median_filter)
+        self.chk_anchor_boundary = QCheckBox("Use displayed film boundary for anchoring")
+        self.chk_anchor_boundary.setToolTip("Uses the red film rectangle when reconverting this displayed film only. "
+            "Otherwise automatic response-validity masking is used. Changes thickness correction, not the analysis ROI.")
+        conv_layout.addWidget(self.chk_anchor_boundary)
+        worker_row = QHBoxLayout()
+        worker_row.addWidget(QLabel("Calibration uncertainty workers:"))
+        self.spin_uncertainty_workers = QSpinBox()
+        self.spin_uncertainty_workers.setRange(1, 8)
+        self.spin_uncertainty_workers.setValue(min(4, max(1, (os.cpu_count() or 1)//2)))
+        self.spin_uncertainty_workers.setToolTip("All parameter samples are retained. Actual parallelism is limited by image size and scratch memory.")
+        worker_row.addWidget(self.spin_uncertainty_workers)
+        conv_layout.addLayout(worker_row)
         
         hbox_conv_btns = QHBoxLayout()
         self.btn_conv_selected = QPushButton("▶️ Convert Selected")
@@ -369,10 +431,14 @@ class PrismDosimetryGUI(QMainWindow):
         main_v_layout = QVBoxLayout(tab)
 
         # TOOLBAR: Visualization & Profile modes
-        tool_layout = QHBoxLayout()
+        self.viewer_toolbar_grid = QGridLayout()
+        self.viewer_tool_groups = [QWidget() for _ in range(4)]
+        toolbar_rows = [QHBoxLayout(group) for group in self.viewer_tool_groups]
+        for row in toolbar_rows: row.setContentsMargins(0, 0, 0, 0)
+        tool_layout = toolbar_rows[0]
         tool_layout.addWidget(QLabel("<b>Colormap:</b>"))
         self.combo_cmap = QComboBox()
-        self.combo_cmap.addItems(["viridis", "plasma", "inferno", "turbo", "bipolar"])
+        self.combo_cmap.addItems(["viridis", "plasma", "inferno", "turbo", "bipolar", "Custom"])
         self.combo_cmap.currentTextChanged.connect(self._change_colormap)
         tool_layout.addWidget(self.combo_cmap)
 
@@ -381,6 +447,7 @@ class PrismDosimetryGUI(QMainWindow):
         self.btn_theme_toggle.clicked.connect(self._toggle_ui_theme)
         tool_layout.addWidget(self.btn_theme_toggle)
 
+        tool_layout = toolbar_rows[1]
         self.chk_isodose = QCheckBox("Isodose Contours (20, 50, 80, 90%)")
         self.chk_isodose.setChecked(False)
         self.chk_isodose.toggled.connect(self._toggle_isodose)
@@ -391,6 +458,7 @@ class PrismDosimetryGUI(QMainWindow):
         self.chk_show_roi.toggled.connect(self._toggle_roi_visibility)
         tool_layout.addWidget(self.chk_show_roi)
 
+        tool_layout = toolbar_rows[2]
         tool_layout.addWidget(QLabel("<b>Profile Mode:</b>"))
         self.combo_prof_mode = QComboBox()
         self.combo_prof_mode.addItems(["Orthogonal (X/Y)", "Oblique (Angle/Line)"])
@@ -404,36 +472,56 @@ class PrismDosimetryGUI(QMainWindow):
         self.spin_band.valueChanged.connect(lambda: self.update_profiles())
         tool_layout.addWidget(self.spin_band)
 
+        tool_layout = toolbar_rows[3]
         tool_layout.addWidget(QLabel("<b>Split View / Overlay:</b>"))
         self.slider_blend = QSlider(Qt.Horizontal)
+        self.slider_blend.setMinimumWidth(60)
         self.slider_blend.setRange(0, 100)
         self.slider_blend.setValue(100) # 100: Pure Dose, 0: Pure Raw
         self.slider_blend.valueChanged.connect(self._update_blended_view)
         tool_layout.addWidget(self.slider_blend)
 
-        main_v_layout.addLayout(tool_layout)
+        for index, group in enumerate(self.viewer_tool_groups):
+            self.viewer_toolbar_grid.addWidget(group, index//2, index%2)
+        main_v_layout.addLayout(self.viewer_toolbar_grid)
 
-        main_splitter = QSplitter(Qt.Vertical)
-        main_v_layout.addWidget(main_splitter)
+        view_controls = QHBoxLayout()
+        self.combo_view_layout = QComboBox()
+        self.combo_view_layout.addItems(["Layout: Automatic", "Layout: Detailed", "Layout: Compact"])
+        self.btn_map_focus = QPushButton("Enlarge map")
+        self.btn_map_focus.setCheckable(True)
+        self.chk_view_raw = QCheckBox("Raw film")
+        self.chk_view_stats = QCheckBox("Statistics / DAH")
+        self.lbl_view_layout = QLabel()
+        for widget in (self.combo_view_layout, self.btn_map_focus, self.chk_view_raw, self.chk_view_stats,
+                       self.lbl_view_layout):
+            view_controls.addWidget(widget)
+        view_controls.addStretch()
+        main_v_layout.addLayout(view_controls)
 
         # ==========================================
         # FELSŐ RÉSZ: Képek (Nyers és Dózis)
         # ==========================================
         self.composite_export_container = QWidget()
-        self.composite_export_container.setStyleSheet("QWidget { background-color: #1a1a1a; color: #EEEEEE; }")
+        self.composite_export_container.setStyleSheet("QWidget { background-color: #1a1a1a; color: #EEEEEE; } "
+            "QSplitter::handle { background-color: #444444; } QSplitter::handle:hover { background-color: #888888; }")
         comp_layout = QVBoxLayout(self.composite_export_container)
         comp_layout.setContentsMargins(4, 4, 4, 4)
         comp_layout.setSpacing(8)
 
-        images_splitter = QSplitter(Qt.Horizontal)
+        self.analysis_splitter = QSplitter(Qt.Vertical)
+        comp_layout.addWidget(self.analysis_splitter)
+        images_splitter = self.images_splitter = QSplitter(Qt.Horizontal)
 
         # 1. BAL PANEL: Nyers Film
-        raw_widget = QWidget()
+        raw_widget = self.raw_view_panel = QWidget()
         raw_layout = QVBoxLayout(raw_widget)
         raw_layout.setContentsMargins(0, 0, 0, 0)
         raw_layout.addWidget(QLabel("<b>Raw Scanned Film (RGB) with Synced Reticle</b>"))
         
         self.glw_raw = pg.GraphicsLayoutWidget()
+        self.glw_raw.setMinimumSize(100, 100)
+        self.glw_raw.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.plot_raw = self.glw_raw.addPlot()
         self.plot_raw.setAspectLocked(True)
         self.plot_raw.invertY(True)
@@ -447,7 +535,7 @@ class PrismDosimetryGUI(QMainWindow):
         self.plot_raw.addItem(self.v_line_raw, ignoreBounds=True)
         self.plot_raw.addItem(self.h_line_raw, ignoreBounds=True)
 
-        raw_layout.addWidget(self.glw_raw)
+        raw_layout.addWidget(self.glw_raw, stretch=1)
         images_splitter.addWidget(raw_widget)
 
         # 2. JOBB PANEL: Konvertált Dózistérkép + Tengelyprofilok + Színskála
@@ -457,33 +545,57 @@ class PrismDosimetryGUI(QMainWindow):
         
         header_hbox = QHBoxLayout()
         self.lbl_map_title = QLabel("<b>Beam Dose Map [Gy] & LWFA Analytics</b>")
-        header_hbox.addWidget(self.lbl_map_title)
+        dose_layout.addWidget(self.lbl_map_title)
         self.btn_toggle_map = QPushButton("👁️ Bizonytalanság (STD) Mutatása")
         self.btn_toggle_map.setCheckable(True)
         self.btn_toggle_map.setStyleSheet("font-weight: bold; background-color: #f0ad4e; color: black;")
         self.btn_toggle_map.clicked.connect(self._toggle_map_view)
         header_hbox.addWidget(self.btn_toggle_map)
-        self.btn_save_snapshot = QPushButton("📸 Save Publication Figure (300 DPI)")
+        self.btn_auto_window = QPushButton("Auto window")
+        self.btn_auto_window.clicked.connect(lambda: self._render_map_display(reset_levels=True))
+        header_hbox.addWidget(self.btn_auto_window)
+        self.btn_save_snapshot = QPushButton("📸 Save figure (300 DPI)")
         self.btn_save_snapshot.setStyleSheet("font-weight: bold; background-color: #0078D7; color: white;")
+        self.btn_save_snapshot.setToolTip("Exports the visible arrangement. Enable Raw film and Statistics / DAH "
+            "and restore the normal view to include all panels.")
         self.btn_save_snapshot.clicked.connect(self.save_dose_snapshot)
         header_hbox.addStretch()
         header_hbox.addWidget(self.btn_save_snapshot)
         dose_layout.addLayout(header_hbox)
 
+        self.profile_vertical_splitter = QSplitter(Qt.Vertical)
+        self.profile_horizontal_splitter = QSplitter(Qt.Horizontal)
+        self.profile_vertical_splitter.addWidget(self.profile_horizontal_splitter)
+        self.glw_prof_y = pg.GraphicsLayoutWidget()
         self.glw_dose = pg.GraphicsLayoutWidget()
-        
-        self.plot_prof_y = self.glw_dose.addPlot(row=0, col=0)
+        self.glw_prof_x = pg.GraphicsLayoutWidget()
+        for canvas in (self.glw_dose, self.glw_prof_x, self.glw_prof_y):
+            canvas.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.glw_dose.setMinimumSize(220, 160)
+        self.glw_prof_y.setMinimumSize(90, 100)
+        self.glw_prof_x.setMinimumSize(0, 120)
+        self.profile_x_panel = QWidget()
+        self.profile_x_panel.setMinimumHeight(120)
+        self.glw_prof_x.setParent(self.profile_x_panel)
+        self.profile_horizontal_splitter.addWidget(self.glw_prof_y)
+        self.profile_horizontal_splitter.addWidget(self.glw_dose)
+        self.profile_vertical_splitter.addWidget(self.profile_x_panel)
+        self.profile_horizontal_splitter.setCollapsible(1, False)
+        self.profile_vertical_splitter.setCollapsible(0, False)
+        self.profile_horizontal_splitter.setStretchFactor(1, 1)
+        self.profile_vertical_splitter.setStretchFactor(0, 1)
+
+        self.plot_prof_y = self.glw_prof_y.addPlot()
         self.plot_prof_y.setLabel('bottom', 'Dose [Gy]')
         self.plot_prof_y.setLabel('left', 'Y (CAX) [mm]')
         self.plot_prof_y.invertY(True)
-        self.plot_prof_y.setMaximumWidth(180)
         self.curve_prof_y = self.plot_prof_y.plot(pen=self.pen_prof_y)
         self.curve_prof_y_up = pg.PlotCurveItem(pen=pg.mkPen(None))
         self.curve_prof_y_dn = pg.PlotCurveItem(pen=pg.mkPen(None))
         self.fill_prof_y = pg.FillBetweenItem(self.curve_prof_y_dn, self.curve_prof_y_up, brush=(0, 170, 255, 60))
         self.plot_prof_y.addItem(self.fill_prof_y)
 
-        self.plot_dose = self.glw_dose.addPlot(row=0, col=1)
+        self.plot_dose = self.glw_dose.addPlot(row=0, col=0)
         self.plot_dose.setLabel('bottom', 'X [mm]')
         self.plot_dose.setLabel('left', 'Y [mm]')
         self.plot_dose.setAspectLocked(True)
@@ -496,39 +608,35 @@ class PrismDosimetryGUI(QMainWindow):
         self.img_item_dose = pg.ImageItem(autoDownsample=False)
         self.img_item_dose.setZValue(-5)
         self.plot_dose.addItem(self.img_item_dose)
-        self.plot_prof_y.setYLink(self.plot_dose)
+        self.plot_prof_y.setYLink(None)
 
         self.colorbar = pg.HistogramLUTItem()
         self.colorbar.setImageItem(self.img_item_dose)
         self.colorbar.gradient.loadPreset('viridis')
-        self.colorbar.setMinimumWidth(100)
-        self.colorbar.setMaximumWidth(130)
-        self.glw_dose.addItem(self.colorbar, row=0, col=2)
+        self.colorbar.setMinimumWidth(75)
+        self.colorbar.setMaximumWidth(105)
+        self.glw_dose.addItem(self.colorbar, row=0, col=1)
         self.colorbar.sigLevelsChanged.connect(self._on_lut_levels_changed)
         self.colorbar.sigLookupTableChanged.connect(self._on_lut_gradient_changed)
 
-        self.plot_prof_x = self.glw_dose.addPlot(row=1, col=1)
+        self.plot_prof_x = self.glw_prof_x.addPlot()
         self.plot_prof_x.setLabel('left', 'Dose [Gy]')
         self.plot_prof_x.setLabel('bottom', 'Axis / Path [mm]')
-        self.plot_prof_x.setMaximumHeight(180)
         self.curve_prof_x = self.plot_prof_x.plot(pen=self.pen_prof_x)
         self.curve_prof_x_up = pg.PlotCurveItem(pen=pg.mkPen(None))
         self.curve_prof_x_dn = pg.PlotCurveItem(pen=pg.mkPen(None))
         self.fill_prof_x = pg.FillBetweenItem(self.curve_prof_x_dn, self.curve_prof_x_up, brush=(255, 170, 0, 60))
         self.plot_prof_x.addItem(self.fill_prof_x)
         self.curve_prof_fit = self.plot_prof_x.plot(pen=pg.mkPen('r', width=1.5, style=Qt.DashLine))
-        self.plot_prof_x.setXLink(self.plot_dose)
+        self.plot_prof_x.setXLink(None)
 
         # Szuper-Gauss illesztés 50%-os (FWHM) kontúrja a 2D térképen
         self.fit_contour = pg.PlotCurveItem(pen=pg.mkPen('w', width=2.0, style=Qt.DashLine))
         self.fit_contour.setZValue(10)
         self.plot_dose.addItem(self.fit_contour)
 
-        self.glw_dose.ci.layout.setColumnStretchFactor(0, 0)
-        self.glw_dose.ci.layout.setColumnStretchFactor(1, 10)
-        self.glw_dose.ci.layout.setColumnStretchFactor(2, 0)
-        self.glw_dose.ci.layout.setRowStretchFactor(0, 8)
-        self.glw_dose.ci.layout.setRowStretchFactor(1, 0)
+        self.glw_dose.ci.layout.setColumnStretchFactor(0, 1)
+        self.glw_dose.ci.layout.setColumnStretchFactor(1, 0)
 
         self.v_line = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('y', width=1.5, style=Qt.DashLine))
         self.h_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen('c', width=1.5, style=Qt.DashLine))
@@ -552,11 +660,11 @@ class PrismDosimetryGUI(QMainWindow):
         self.plot_dose.addItem(self.roi)
         self.roi.sigRegionChangeFinished.connect(self.update_roi_stats)
 
-        dose_layout.addWidget(self.glw_dose)
+        dose_layout.addWidget(self.profile_vertical_splitter)
         images_splitter.addWidget(dose_widget)
         images_splitter.setSizes([500, 720])
         
-        comp_layout.addWidget(images_splitter, stretch=3)
+        self.analysis_splitter.addWidget(images_splitter)
 
         # ==========================================
         # ALSÓ RÉSZ: ROI Statisztikák (Teljes szélesség)
@@ -619,11 +727,26 @@ class PrismDosimetryGUI(QMainWindow):
 
         bottom_layout.addWidget(self.stats_group, stretch=3)
 
+        histogram_panel = QWidget()
+        histogram_layout = QVBoxLayout(histogram_panel)
+        histogram_controls = QHBoxLayout()
+        self.combo_hist_normalization = QComboBox()
+        self.combo_hist_normalization.addItems(["Distribution: peak = 100%", "Distribution: area per bin [%]"])
+        self.combo_hist_range = QComboBox()
+        self.combo_hist_range.addItems(["Dose axis: ROI range", "Dose axis: full, from 0 Gy"])
+        self.combo_hist_range.setToolTip("Zoom changes only the displayed dose range; DAH always counts the full ROI.")
+        self.combo_dah_band = QComboBox()
+        self.combo_dah_band.addItems(["DAH: no confidence interval estimated", "DAH: ±σ envelope (not a CI)"])
+        histogram_controls.addWidget(self.combo_hist_normalization)
+        histogram_layout.addLayout(histogram_controls)
+        histogram_layout.addWidget(self.combo_hist_range)
+        histogram_layout.addWidget(self.combo_dah_band)
         self.plot_roi_hist = pg.PlotWidget(title="Beam Dose Distribution & Cumulative DAH")
         self.plot_roi_hist.setLabel('bottom', 'Dose [Gy]')
         self.plot_roi_hist.setLabel('left', 'Relative Area [%]')
         self.plot_roi_hist.setYRange(0, 105)
-        self.plot_roi_hist.setMinimumWidth(260)
+        self.plot_roi_hist.setMinimumWidth(420)
+        self.plot_roi_hist.setMinimumHeight(230)
         self.curve_roi_hist = self.plot_roi_hist.plot(
             stepMode="center", fillLevel=0, fillOutline=True, 
             brush=(0, 120, 220, 90), pen=self.pen_hist
@@ -637,10 +760,20 @@ class PrismDosimetryGUI(QMainWindow):
         )
         self.plot_roi_hist.addItem(self.fill_dah_ci)
         
-        bottom_layout.addWidget(self.plot_roi_hist, stretch=2)
-        comp_layout.addWidget(bottom_panel, stretch=1)
-
-        main_splitter.addWidget(self.composite_export_container)
+        histogram_layout.addWidget(self.plot_roi_hist)
+        bottom_layout.addWidget(histogram_panel, stretch=2)
+        self.combo_hist_normalization.currentIndexChanged.connect(self.update_roi_stats)
+        self.combo_dah_band.currentIndexChanged.connect(self.update_roi_stats)
+        self.combo_hist_range.currentIndexChanged.connect(self.update_roi_stats)
+        self.stats_scroll = QScrollArea()
+        self.stats_scroll.setWidgetResizable(True)
+        self.stats_scroll.setWidget(bottom_panel)
+        self.stats_scroll.setMinimumSize(0, 100)
+        self.stats_scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.analysis_splitter.addWidget(self.stats_scroll)
+        self.analysis_splitter.setCollapsible(0, False)
+        self.analysis_splitter.setStretchFactor(0, 1)
+        main_v_layout.addWidget(self.composite_export_container)
         return tab
 
     def _create_placeholder_tab(self, title, description):
@@ -675,11 +808,15 @@ class PrismDosimetryGUI(QMainWindow):
             QGroupBox {{ border: 1px solid {border_color}; margin-top: 6px; padding-top: 8px; font-weight: bold; }}
             QGroupBox::title {{ subcontrol-origin: margin; left: 7px; padding: 0 3px; color: {text_color}; }}
             QLabel {{ color: {text_color}; }}
+            QSplitter::handle {{ background-color: {border_color}; }}
+            QSplitter::handle:hover {{ background-color: #888888; }}
         """)
 
         # 2. Háttérszín beállítása a vásznakon (beleértve a nyers nézetet is!)
         self.glw_raw.setBackground(bg_color)
         self.glw_dose.setBackground(bg_color)
+        self.glw_prof_x.setBackground(bg_color)
+        self.glw_prof_y.setBackground(bg_color)
         self.plot_roi_hist.setBackground(bg_color)
 
         # 3. Tengelyek színezése és vastagítása
@@ -698,7 +835,7 @@ class PrismDosimetryGUI(QMainWindow):
                 ax.setPen(pg.mkPen(text_color, width=axis_pen_width))
 
         # 4. Diagram felirat és ROI körvonal kontrasztja
-        self.plot_roi_hist.setTitle("Beam Dose Distribution & Cumulative DAH", color=text_color)
+        self.plot_roi_hist.setTitle(self._beam_distribution_title(), color=text_color)
         roi_pen = pg.mkPen('k' if white_mode else 'w', width=2.0 * w_factor)
         self.roi.setPen(roi_pen)
 
@@ -731,9 +868,12 @@ class PrismDosimetryGUI(QMainWindow):
     # TOOLBAR & INTERACTIVE PROFILE CONTROLS
     # =========================================================================
     def _change_colormap(self, cmap_name):
-        self.colorbar.gradient.loadPreset(cmap_name)
-        if self.current_dose_map is not None:
-            self._on_lut_gradient_changed()
+        if cmap_name == 'Custom': return
+        previous = self._updating_map_view
+        self._updating_map_view = True
+        try: self.colorbar.gradient.loadPreset(cmap_name)
+        finally: self._updating_map_view = previous
+        self._remember_map_display()
 
     def _on_profile_mode_changed(self, idx):
         if idx == 0:  # Orthogonal
@@ -742,7 +882,7 @@ class PrismDosimetryGUI(QMainWindow):
             self.line_roi.hide()
             self.plot_prof_y.show()
             self.plot_prof_x.setLabel('bottom', 'X (CAX) [mm]')
-            self.plot_prof_x.setXLink(self.plot_dose)  # Visszaláncoljuk a fő képre
+            self.plot_prof_x.setXLink(None)  # Position span follows the film, not map viewport padding.
         else:  # Oblique
             self.v_line.hide()
             self.h_line.hide()
@@ -750,6 +890,7 @@ class PrismDosimetryGUI(QMainWindow):
             self.plot_prof_y.hide()
             self.plot_prof_x.setLabel('bottom', 'Oblique Path [mm]')
             self.plot_prof_x.setXLink(None)  # Ferde vonalnál leválasztjuk az X-tengelyt!
+        if hasattr(self, 'viewer_layout'): self.viewer_layout.refresh_visibility()
         self.update_profiles()
 
     def _toggle_isodose(self, checked):
@@ -861,6 +1002,7 @@ class PrismDosimetryGUI(QMainWindow):
         if not ok or not project_name.strip(): return
 
         new_project_path = Path(parent_dir) / project_name.strip()
+        self._reset_project_session()
         self.project_dir = new_project_path
         self.raw_dir = self.project_dir / "raw"
         self.processed_dir = self.project_dir / "processed"
@@ -883,6 +1025,14 @@ class PrismDosimetryGUI(QMainWindow):
 
         self.refresh_file_lists()
 
+        if sys.platform == 'win32':
+            QMessageBox.information(self, 'Project created',
+                                    f'Project ready:\n{self.project_dir}\n\n'
+                                    'Acquire 16-bit RGB TIFFs in your scanner software, copy them into '
+                                    'the raw folder, then refresh the file list. '
+                                    'Integrated Windows acquisition requires a separate 48-bit RGB backend.')
+            return
+
         scanner_script = Path(__file__).parent / "scan.py"
         if not scanner_script.exists():
             QMessageBox.warning(self, "Scanner Missing", f"Could not find '{scanner_script.name}'.")
@@ -899,6 +1049,7 @@ class PrismDosimetryGUI(QMainWindow):
 
     def _invalidate_blank_rgb(self):
         self.global_blank_rgb = None
+        self.global_blank_std = None
 
     def open_blank_roi_dialog(self):
         blank_name = self.combo_blank_film.currentText()
@@ -918,14 +1069,66 @@ class PrismDosimetryGUI(QMainWindow):
             )
 
     def _on_lut_levels_changed(self):
-        if self.current_dose_map is not None and self.slider_blend.value() == 100:
-            levels = self.colorbar.getLevels()
-            self.img_item_dose.setLevels(levels, update=True)
+        # HistogramLUTItem already updates its linked ImageItem. Avoid a second
+        # feedback path that can carry STD levels/LUT into the dose view.
+        self._remember_map_display()
 
     def _on_lut_gradient_changed(self):
-        if self.current_dose_map is not None and self.slider_blend.value() == 100:
-            lut = self.colorbar.getLookupTable(img=self.current_dose_map, n=256)
-            self.img_item_dose.setLookupTable(lut, update=True)
+        if self._updating_map_view: return
+        blocked = self.combo_cmap.blockSignals(True)
+        self.combo_cmap.setCurrentText('Custom')
+        self.combo_cmap.blockSignals(blocked)
+        self._remember_map_display()
+
+    def _remember_map_display(self):
+        if self._updating_map_view or self.current_dose_map is None: return
+        levels = self.colorbar.getLevels()
+        if levels is None or not np.all(np.isfinite(levels)) or levels[0] >= levels[1]: return
+        self._map_display_states[self._display_map_mode] = {
+            'levels': list(levels), 'histogram_range': list(self.colorbar.getHistogramRange()),
+            'gradient': self.colorbar.gradient.saveState(), 'preset': self.combo_cmap.currentText()}
+
+    def _film_pixel_bounds(self):
+        h, w = self.current_dose_map.shape
+        pos, size = self.film_boundary.pos(), self.film_boundary.size()
+        x1 = int(np.clip(pos.x(), 0, w-1)); y1 = int(np.clip(pos.y(), 0, h-1))
+        x2 = int(np.clip(pos.x()+size.x(), x1+1, w)); y2 = int(np.clip(pos.y()+size.y(), y1+1, h))
+        return x1, x2, y1, y2
+
+    def _render_map_display(self, reset_levels=False):
+        if self.current_dose_map is None: return
+        data = self.current_std_map if self._display_map_mode == 'std' else self.current_dose_map
+        if data is None: return
+        x1, x2, y1, y2 = self._film_pixel_bounds()
+        active = data[y1:y2, x1:x2]
+        state = self._map_display_states.get(self._display_map_mode, {})
+        levels = state.get('levels')
+        if reset_levels or levels is None:
+            lo, hi = np.percentile(active, [1, 99.5])
+            if lo >= hi: hi = lo + max(abs(float(lo))*.05, 1e-4)
+            levels = [float(lo), float(hi)]
+        preset = state.get('preset', 'inferno' if self._display_map_mode == 'std' else self.combo_cmap.currentText())
+        previous = self._updating_map_view; self._updating_map_view = True
+        try:
+            self.img_item_dose.setImage(data, autoLevels=False, levels=levels)
+            if 'gradient' in state: self.colorbar.gradient.restoreState(state['gradient'])
+            else: self.colorbar.gradient.loadPreset(preset if preset != 'Custom' else 'viridis')
+            self.colorbar.setLevels(*levels)
+            histogram_range = levels if reset_levels else state.get('histogram_range', levels)
+            self.colorbar.setHistogramRange(*histogram_range, padding=.08 if reset_levels or not state else 0.)
+            lo, hi = self.colorbar.getHistogramRange()
+            counts, edges = np.histogram(active, bins=128, range=(lo, hi))
+            self.colorbar.plot.setData((edges[:-1]+edges[1:])/2, counts)
+            self.colorbar.setToolTip('Display histogram/window uses the selected film boundary; data values are unchanged.')
+            self.img_item_dose.setLevels(levels, update=True)
+            blocked = self.combo_cmap.blockSignals(True)
+            self.combo_cmap.setCurrentText(preset)
+            self.combo_cmap.blockSignals(blocked)
+        finally: self._updating_map_view = previous
+        self._map_display_states[self._display_map_mode] = {
+            'levels': list(levels), 'histogram_range': list(self.colorbar.getHistogramRange()),
+            'gradient': self.colorbar.gradient.saveState(), 'preset': preset}
+        self._update_blended_view()
 
     def save_dose_snapshot(self):
         if self.current_dose_map is None:
@@ -1016,10 +1219,72 @@ class PrismDosimetryGUI(QMainWindow):
     # =========================================================================
     # PROJECT & CALIBRATION MANAGEMENT
     # =========================================================================
+    def _clear_analysis_views(self):
+        self.morphology_tab.invalidate_analysis()
+        self._map_display_states = {}
+        for value in vars(self).values():
+            if isinstance(value, pg.PlotDataItem):
+                value.setData([], [])
+        for name in ('lbl_beam_peak', 'lbl_beam_com', 'lbl_beam_fwhm', 'lbl_roi_area',
+                     'lbl_fit_amp', 'lbl_fit_sigma', 'lbl_fit_theta', 'lbl_total_dose',
+                     'lbl_dose_stats', 'lbl_dose_std', 'lbl_roi_uncert', 'lbl_dose_minmax',
+                     'lbl_d90_val', 'lbl_penumbra', 'lbl_flatness', 'lbl_symmetry', 'lbl_conv_method'):
+            getattr(self, name).setText('—')
+        for curve in self.isocurves:
+            self.plot_dose.removeItem(curve)
+        self.isocurves = []
+
+    def _reset_project_session(self):
+        self._clear_analysis_views()
+        old_morph = self.morphology_tab
+        index = self.tabs.indexOf(old_morph)
+        self.tabs.removeTab(index)
+        self.morphology_tab = MorphologyTab(self)
+        self.tabs.insertTab(index, self.morphology_tab, "🌌 Advanced Beam Morphology")
+        old_morph.deleteLater()
+        self.engine = None
+        self.calib_dir = None
+        self.global_blank_rgb = None
+        self.global_blank_std = None
+        self.current_dose_path = None
+        self.current_raw_path = None
+        self.current_dose_map = None
+        self.current_std_map = None
+        self.current_raw_img = None
+        self.current_meta = {}
+        self.img_item_raw.clear(); self.img_item_dose.clear()
+        self.lbl_calib_status.setText("No calibration loaded")
+        old = self.bio_tab
+        old.tasks.cancel()
+        index = self.tabs.indexOf(old)
+        self.tabs.removeTab(index)
+        self.bio_tab = BioDosimetryTab()
+        self.tabs.insertTab(index, self.bio_tab, "🧬 Radiobiology & 3D Sample Dosimetry")
+        old.deleteLater()
+
+    def save_project_state(self):
+        if self.project_dir is None: return
+        try:
+            from project_state import save_session
+            path = save_session(self)
+            QMessageBox.information(self, "Project saved", str(path))
+        except Exception as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+
+    def restore_project_state(self):
+        if self.project_dir is None: return
+        try:
+            from project_state import restore_session
+            restore_session(self)
+            QMessageBox.information(self, "Project restored", "Settings restored. Recompute sample and morphology analyses.")
+        except Exception as error:
+            QMessageBox.critical(self, "Restore failed", str(error))
+
     def select_project_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Project Folder")
         if not folder: return
         selected_path = Path(folder)
+        self._reset_project_session()
         self.project_dir = selected_path.parent if selected_path.name.lower() == "raw" else selected_path
 
         self.raw_dir = self.project_dir / "raw"
@@ -1041,11 +1306,19 @@ class PrismDosimetryGUI(QMainWindow):
     def refresh_file_lists(self):
         if not self.project_dir: return
         self.list_raw_files.clear()
+        previous_blank = self.combo_blank_film.currentText()
+        was_blocked = self.combo_blank_film.blockSignals(True)
         self.combo_blank_film.clear()
-        raw_files = sorted([f for f in self.raw_dir.iterdir() if f.is_file() and f.suffix.lower() in [".tif", ".tiff"]])
+        raw_files = sorted(f for f in self.raw_dir.iterdir()
+                           if f.is_file() and is_raw_film(f) and not scan_paths(f)['lock'].exists())
         for f in raw_files:
             self.list_raw_files.addItem(f.name)
             self.combo_blank_film.addItem(f.name)
+        if previous_blank and self.combo_blank_film.findText(previous_blank) >= 0:
+            self.combo_blank_film.setCurrentText(previous_blank)
+        else:
+            self._invalidate_blank_rgb()
+        self.combo_blank_film.blockSignals(was_blocked)
         self.list_proc_files.clear()
         proc_files = sorted(list(self.processed_dir.glob("*_dose.npy")))
         for f in proc_files:
@@ -1095,7 +1368,8 @@ class PrismDosimetryGUI(QMainWindow):
         cleaning = self.chk_calib_clean.isChecked()
 
         self._set_ui_busy(True)
-        self.worker = EngineWorker('calibrate', self.engine, folder=str(self.calib_dir), doses=doses, method=method, cleaning=cleaning)
+        self.worker = EngineWorker('calibrate', self.engine, folder=str(self.calib_dir), doses=doses, method=method, cleaning=cleaning,
+            mcmc_adaptation=self.combo_mcmc_adaptation.currentData())
         self.worker.finished.connect(self._on_calib_finished)
         self.worker.error.connect(self._on_worker_error)
         self.worker.start()
@@ -1155,9 +1429,33 @@ class PrismDosimetryGUI(QMainWindow):
             method = 'fast'
         cleaning = self.chk_conv_clean.isChecked()
 
+        anchor_bounds = None
+        if self.chk_anchor_boundary.isChecked() and method != 'fast':
+            dose_path = getattr(self, 'current_dose_path', None)
+            if (len(file_paths) != 1 or dose_path is None or self.current_dose_map is None
+                    or dose_path.parent.resolve() != self.processed_dir.resolve()
+                    or Path(file_paths[0]).stem != dose_path.stem.removesuffix('_dose')):
+                QMessageBox.warning(self, "Film boundary", "Select only the film whose dose map is displayed, "
+                    "or uncheck the film-boundary option for automatic masking.")
+                return
+            h, w = self.current_dose_map.shape
+            try:
+                with tifffile.TiffFile(file_paths[0]) as tif:
+                    shape = tif.pages[0].shape[:2]
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, "Film boundary", f"Cannot read the selected raw film: {error}")
+                return
+            if tuple(shape) != (h, w):
+                QMessageBox.warning(self, "Film boundary", "Displayed dose and raw film dimensions differ.")
+                return
+            x1, x2, y1, y2 = self._film_pixel_bounds()
+            anchor_bounds = (x1/w, y1/h, x2/w, y2/h)
         self.engine.output_folder = str(self.processed_dir)
         self._set_ui_busy(True)
-        self.worker = EngineWorker('process', self.engine, files=file_paths, blank=blank_path, method=method, cleaning=cleaning, blank_rgb=self.global_blank_rgb)
+        self.worker = EngineWorker('process', self.engine, files=file_paths, blank=blank_path, method=method, cleaning=cleaning, blank_rgb=self.global_blank_rgb, median_filtering=self.chk_median_filter.isChecked(),
+            settings=ProcessingSettings(method=method, cleaning=cleaning, blank_rgb=self.global_blank_rgb,
+                median_filtering=self.chk_median_filter.isChecked(), random_seed=self.engine.random_seed,
+                uncertainty_workers=self.spin_uncertainty_workers.value(), anchor_bounds=anchor_bounds))
         self.worker.finished.connect(self._on_process_finished)
         self.worker.error.connect(self._on_worker_error)
         self.worker.start()
@@ -1177,6 +1475,8 @@ class PrismDosimetryGUI(QMainWindow):
         self.btn_conv_selected.setEnabled(not busy)
         self.btn_conv_all.setEnabled(not busy)
         self.btn_set_blank_roi.setEnabled(not busy)
+        for name in ('btn_save_state', 'btn_restore_state', 'btn_open_proj', 'btn_new_proj_scan', 'btn_sel_calib_dir', 'btn_load_json'):
+            getattr(self, name).setEnabled(not busy)
 
     # =========================================================================
     # DISPLAY & INTERACTIVE ANALYSIS
@@ -1201,6 +1501,7 @@ class PrismDosimetryGUI(QMainWindow):
 
     def load_and_display_raw(self, path: Path):
         try:
+            ensure_scan_ready(path)
             img = tifffile.imread(str(path))
             if img.ndim == 3 and img.shape[2] > 3:
                 img = img[:, :, :3]
@@ -1208,6 +1509,7 @@ class PrismDosimetryGUI(QMainWindow):
                 img_disp = (img / 256).astype(np.uint8)
             else:
                 img_disp = img
+            self.current_raw_path = Path(path).resolve()
             self.current_raw_img = img_disp
             self.img_item_raw.setImage(img_disp)
             self.plot_raw.autoRange()
@@ -1220,22 +1522,38 @@ class PrismDosimetryGUI(QMainWindow):
             QMessageBox.critical(self, "Image Error", f"Failed to display raw image:\n{e}")
 
     def load_and_display_dose(self, dose_path: Path):
+        self._updating_map_view = True
         try:
             dose_map = np.load(str(dose_path)).astype(np.float32)
+            if dose_map.ndim != 2 or 0 in dose_map.shape or not np.all(np.isfinite(dose_map)) or np.any(dose_map < 0):
+                raise ValueError('Expected a finite, nonnegative 2D dose map.')
+            self.morphology_tab.invalidate_analysis()
             self.current_dose_map = dose_map
             
             # --- ÚJ: std térkép betöltése ---
             std_path = dose_path.with_name(dose_path.name.replace("_dose.npy", "_std.npy"))
             if std_path.exists():
                 std_map = np.load(str(std_path)).astype(np.float32)
+                if std_map.shape != dose_map.shape or not np.all(np.isfinite(std_map)) or np.any(std_map < 0):
+                    raise ValueError('STD must match the dose map and be finite and nonnegative.')
                 self.current_std_map = std_map
             else:
                 self.current_std_map = None
             # --------------------------------
             
+            self.current_dose_path = Path(dose_path).resolve()
+            dose_style = self._map_display_states.get('dose', {})
+            self._display_map_mode = 'dose'
+            self._map_display_states = {'dose': {key: dose_style[key] for key in ('gradient', 'preset') if key in dose_style}}
+            self.btn_toggle_map.setChecked(False)
+            self.btn_toggle_map.setStyleSheet("font-weight: bold; background-color: #f0ad4e; color: black;")
+            self.btn_toggle_map.setText("👁️ Bizonytalanság (STD) Mutatása")
+            self.lbl_map_title.setText("<b>Beam Dose Map [Gy] & LWFA Analytics</b>")
             self.current_film_name = dose_path.stem.replace("_dose", "")
+            self.morphology_tab.measured.bind_film()
 
             meta_path = dose_path.with_name(dose_path.name.replace("_dose.npy", "_meta.json"))
+            self.current_meta = {}
             if meta_path.exists():
                 with open(meta_path, 'r') as f:
                     self.current_meta = json.load(f)
@@ -1262,8 +1580,14 @@ class PrismDosimetryGUI(QMainWindow):
             self.roi.setSize([roi_w, roi_h])
 
             margin_x, margin_y = int(w * 0.05), int(h * 0.05)
-            self.film_boundary.setPos([margin_x, margin_y])
-            self.film_boundary.setSize([w - 2 * margin_x, h - 2 * margin_y])
+            bounds = self.current_meta.get('anchor_bounds_normalized')
+            if bounds is not None:
+                bounds = ProcessingSettings(anchor_bounds=bounds).anchor_bounds
+                self.film_boundary.setPos([round(bounds[0]*w), round(bounds[1]*h)])
+                self.film_boundary.setSize([round(bounds[2]*w)-round(bounds[0]*w), round(bounds[3]*h)-round(bounds[1]*h)])
+            else:
+                self.film_boundary.setPos([margin_x, margin_y])
+                self.film_boundary.setSize([w - 2 * margin_x, h - 2 * margin_y])
 
             spacing = float(self.current_meta.get("pixel_spacing_mm", 0.0846))
             self.plot_dose.getAxis('bottom').setScale(spacing)
@@ -1281,6 +1605,8 @@ class PrismDosimetryGUI(QMainWindow):
             self.update_roi_stats()
         except Exception as e:
             QMessageBox.critical(self, "Dose Map Error", f"Failed to load dose map:\n{e}")
+        finally:
+            self._updating_map_view = False
 
     def _toggle_map_view(self):
         """Vált a Dózistérkép és a Bizonytalansági (STD) térkép között."""
@@ -1299,30 +1625,21 @@ class PrismDosimetryGUI(QMainWindow):
             # STD térkép megjelenítése (Piros/Fekete kontrasztos nézet)
             self.btn_toggle_map.setText("👁️ Vissza a Dózisra")
             self.btn_toggle_map.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold;")
-            self.lbl_map_title.setText("<b>Model Uncertainty (STD) Map [Gy]</b>")
+            incomplete = self.current_meta.get('calibration_uncertainty_available') is False
+            qualifier = ' — calibration uncertainty unavailable' if incomplete else ''
+            self.lbl_map_title.setText(f"<b>Model Uncertainty (STD) Map [Gy]{qualifier}</b>")
             
-            map_to_show = self.current_std_map
-            cmap = 'inferno' # Hőtérkép a hibák kiemelésére
         else:
             # Vissza a normál Dózistérképre
             self.btn_toggle_map.setText("👁️ Bizonytalanság (STD) Mutatása")
             self.btn_toggle_map.setStyleSheet("font-weight: bold; background-color: #f0ad4e; color: black;")
             self.lbl_map_title.setText("<b>Beam Dose Map [Gy] & LWFA Analytics</b>")
             
-            map_to_show = self.current_dose_map
-            cmap = self.combo_cmap.currentText()
 
-        # Színskála és kép frissítése a robusztus maximummal
-        min_d = float(np.percentile(map_to_show, 1))
-        max_d = float(np.percentile(map_to_show, 99.5))
-        if min_d >= max_d: max_d = min_d + 1.0
+        self._remember_map_display()
+        self._display_map_mode = 'std' if is_std_mode else 'dose'
+        self._render_map_display()
 
-        self.img_item_dose.setImage(map_to_show, autoLevels=False)
-        self.colorbar.setLevels(min_d, max_d)
-        self.img_item_dose.setLevels((min_d, max_d), update=True)
-        self.colorbar.gradient.loadPreset(cmap)
-        
-        # Profilok frissítése az új térképpel
         self.update_profiles()
 
     def update_boundary_and_profiles(self):
@@ -1336,17 +1653,12 @@ class PrismDosimetryGUI(QMainWindow):
         x2 = int(np.clip(pos.x() + size.x(), x1 + 1, w))
         y2 = int(np.clip(pos.y() + size.y(), y1 + 1, h))
 
-        active_data = self.current_dose_map[y1:y2, x1:x2]
-        if active_data.size > 0:
-            # Sima min/max helyett robusztus percentilis a műtermékek ignorálására!
-            min_d = float(np.percentile(active_data, 1))
-            max_d = float(np.percentile(active_data, 99.5))
-            if min_d >= max_d: max_d = min_d + 1.0
-            
-            self.colorbar.setLevels(min_d, max_d)
-            self.img_item_dose.setLevels((min_d, max_d), update=True)
-            self.colorbar.setHistogramRange(min_d, max_d, padding=0.05)
-            
+        self._render_map_display(reset_levels=True)
+        # Cached automatic windows must be recomputed in the other mode too.
+        other = 'dose' if self._display_map_mode == 'std' else 'std'
+        for key in ('levels', 'histogram_range'):
+            self._map_display_states.get(other, {}).pop(key, None)
+
         self.update_profiles(x1, x2, y1, y2)
 
     def _on_crosshair_moved(self, *args):
@@ -1364,6 +1676,15 @@ class PrismDosimetryGUI(QMainWindow):
         if self.current_dose_map is None: return
         h, w = self.current_dose_map.shape
         band = self.spin_band.value()
+        partial_notice = (' Calibration uncertainty unavailable.'
+                          if getattr(self, 'current_meta', {}).get('calibration_uncertainty_available') is False else '')
+        for plot in (self.plot_prof_x, self.plot_prof_y):
+            plot.setToolTip('Uncertainty band: conservative upper bound from marginal pixel sigmas; '
+                            'not a confidence interval. Spatial covariance is unknown.' + partial_notice)
+        if self.current_std_map is None:
+            for curve in (self.curve_prof_x_up, self.curve_prof_x_dn,
+                          self.curve_prof_y_up, self.curve_prof_y_dn):
+                curve.setData([], [])
 
         if not isinstance(x1, (int, float, np.integer, np.floating)):
             pos = self.film_boundary.pos()
@@ -1401,7 +1722,8 @@ class PrismDosimetryGUI(QMainWindow):
                 self.curve_prof_x_up.setData(s_axis_px, prof + std_prof)
                 self.curve_prof_x_dn.setData(s_axis_px, np.maximum(0, prof - std_prof))
             
-            self.plot_prof_x.autoRange()
+            self.plot_prof_x.setXRange(0, length_px, padding=0)
+            self.plot_prof_x.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
             return
 
         # Orto-normális (X/Y) mód
@@ -1416,9 +1738,7 @@ class PrismDosimetryGUI(QMainWindow):
             self.curve_prof_x.setData(x_px, prof_x)
             
             if self.current_std_map is not None:
-                # Szórás propagálása az átlagolt sávra
-                N_pixels_y = y_high - y_low
-                std_x = np.sqrt(np.sum(self.current_std_map[y_low:y_high, x1:x2]**2, axis=0)) / N_pixels_y
+                std_x = mean_sigma_bound(self.current_std_map[y_low:y_high, x1:x2], axis=0)
                 self.curve_prof_x_up.setData(x_px, prof_x + std_x)
                 self.curve_prof_x_dn.setData(x_px, np.maximum(0, prof_x - std_x))
 
@@ -1430,28 +1750,35 @@ class PrismDosimetryGUI(QMainWindow):
             self.curve_prof_y.setData(prof_y, y_px)
             
             if self.current_std_map is not None:
-                N_pixels_x = x_high - x_low
-                std_y = np.sqrt(np.sum(self.current_std_map[y1:y2, x_low:x_high]**2, axis=1)) / N_pixels_x
+                std_y = mean_sigma_bound(self.current_std_map[y1:y2, x_low:x_high], axis=1)
                 self.curve_prof_y_up.setData(prof_y + std_y, y_px)
                 self.curve_prof_y_dn.setData(np.maximum(0, prof_y - std_y), y_px)
+        self.plot_prof_x.setXRange(x1, x2, padding=0)
+        self.plot_prof_y.setYRange(y1, y2, padding=0)
+        self.plot_prof_x.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        self.plot_prof_y.enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
 
     # =========================================================================
     # ADVANCED LWFA BEAM METRICS & 2D GAUSSIAN FIT
     # =========================================================================
+    def _beam_distribution_title(self):
+        scale = 'Blue: peak=100%' if self.combo_hist_normalization.currentIndex() == 0 else 'Blue: area per bin'
+        band = ('±σ sensitivity envelope (not a CI)' if self.combo_dah_band.currentIndex() == 1
+                and self.current_std_map is not None else 'CI not estimated')
+        return ('Beam Dose Distribution & Cumulative DAH<br>'
+                f'<span style="font-size:10pt">{scale}; red: area ≥ dose; {band}</span>')
+
     def update_roi_stats(self):
         if not hasattr(self, 'roi') or not hasattr(self, 'line_roi'): return
         if self.current_dose_map is None: return
         
-        roi_data = self.roi.getArrayRegion(self.current_dose_map, self.img_item_dose)
+        roi_data = pg.ROI.getArrayRegion(self.roi, self.current_dose_map, self.img_item_dose)
         if roi_data is None or roi_data.size == 0: return
 
         rh, rw = roi_data.shape
         if rh < 3 or rw < 3: return
         
-        yy, xx = np.ogrid[:rh, :rw]
-        cy, cx = (rh - 1) / 2.0, (rw - 1) / 2.0
-        ry, rx = rh / 2.0, rw / 2.0
-        ellipse_mask = ((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2 <= 1.0
+        ellipse_mask = self.roi.renderShapeMask(rw, rh).T > 0.5
 
         valid_pixels = roi_data[ellipse_mask]
         if valid_pixels.size == 0: return
@@ -1495,7 +1822,7 @@ class PrismDosimetryGUI(QMainWindow):
 
         # --- 1/B. Modell Bizonytalanság kinyerése (_std.npy) ugyanazzal a maszkkal ---
         if hasattr(self, 'current_std_map') and self.current_std_map is not None:
-            roi_std_data = self.roi.getArrayRegion(self.current_std_map, self.img_item_dose)
+            roi_std_data = pg.ROI.getArrayRegion(self.roi, self.current_std_map, self.img_item_dose)
             if roi_std_data is not None and roi_std_data.shape == roi_data.shape:
                 valid_std_pixels = roi_std_data[ellipse_mask]
                 mean_uncert = float(np.mean(valid_std_pixels))
@@ -1615,53 +1942,53 @@ class PrismDosimetryGUI(QMainWindow):
 
         if hasattr(self, 'lbl_roi_uncert'):
             if mean_uncert is not None:
-                self.lbl_roi_uncert.setText(f"<b>Model Uncertainty:</b> ±{mean_uncert:.3f} Gy ({rel_uncert:.1f}%)")
+                self.lbl_roi_uncert.setText(f"<b>Mean pixel σ:</b> {mean_uncert:.3f} Gy ({rel_uncert:.1f}%)")
+                self.lbl_roi_uncert.setToolTip('Mean marginal pixel sigma, not the uncertainty of the ROI mean. '
+                    + ('Calibration uncertainty unavailable.' if self.current_meta.get('calibration_uncertainty_available') is False
+                       else 'Spatial covariance is not stored.'))
             else:
                 self.lbl_roi_uncert.setText("<b>Model Uncertainty:</b> N/A (Nincs _std.npy)")
+                self.lbl_roi_uncert.setToolTip('No STD map is available.')
 
-        # 7. Hisztogram és Ensemble-alapú DAH (DVH) konfidenciasáv
-        y, x = np.histogram(valid_pixels, bins=50)
-        bin_centers = (x[:-1] + x[1:]) / 2
-        y_norm = y / np.max(y) * 100.0 if np.max(y) > 0 else y
-        self.curve_roi_hist.setData(x, y_norm, pen=self.pen_hist)
-
-        cum_y = np.cumsum(y[::-1])[::-1]
-        cum_y_norm = cum_y / np.max(cum_y) * 100.0 if np.max(cum_y) > 0 else cum_y
-        self.curve_roi_dah.setData(bin_centers, cum_y_norm, pen=self.pen_dah)
-
-        if hasattr(self, 'current_std_map') and self.current_std_map is not None and valid_std_pixels is not None:
-            rng = np.random.default_rng(42)
-            n_ens = 50
-            from scipy.ndimage import gaussian_filter
-            roi_smooth = gaussian_filter(roi_data, sigma=2.0)
-            smooth_valid_pixels = roi_smooth[ellipse_mask]
-            
-            sys_sigma = np.sqrt(np.maximum(0.0, valid_std_pixels**2 - intrinsic_film_noise**2))
-            z_sys = rng.normal(0.0, 1.0, size=(n_ens, 1))
-            z_rnd = rng.normal(0.0, 1.0, size=(n_ens, valid_pixels.size))
-            
-            ens_doses = np.maximum(
-                0.0,
-                smooth_valid_pixels[None, :] + z_sys * sys_sigma[None, :] + z_rnd * intrinsic_film_noise
-            )
-            
-            d90_ens = np.percentile(ens_doses, 10, axis=1)
-            d90_err = (np.percentile(d90_ens, 84) - np.percentile(d90_ens, 16)) / 2.0
-            self.lbl_d90_val.setText(f"<b>D90%:</b> {d90_val:.2f} ± {d90_err:.2f} Gy | <b>V95%:</b> {v95_val:.1f}%")
-
-            dah_curves = np.zeros((n_ens, len(bin_centers)))
-            for m in range(n_ens):
-                ym, _ = np.histogram(ens_doses[m], bins=x)
-                c_ym = np.cumsum(ym[::-1])[::-1]
-                dah_curves[m] = c_ym / np.max(c_ym) * 100.0 if np.max(c_ym) > 0 else c_ym
-                
-            dah_low = np.percentile(dah_curves, 5, axis=0)
-            dah_high = np.percentile(dah_curves, 95, axis=0)
-            self.curve_dah_low.setData(bin_centers, dah_low)
-            self.curve_dah_high.setData(bin_centers, dah_high)
+        # Histogram height is a display choice; DAH always counts full ROI area.
+        normalization = 'peak' if self.combo_hist_normalization.currentIndex() == 0 else 'area'
+        distribution = beam_dose_distribution(valid_pixels, normalization=normalization)
+        thresholds = distribution['dah_dose']
+        self.curve_roi_hist.setData(distribution['edges'], distribution['histogram'], pen=self.pen_hist)
+        self.curve_roi_dah.setData(thresholds, distribution['dah_area'], pen=self.pen_dah)
+        self.plot_roi_hist.setLabel('left', 'Relative height / area [%]' if normalization == 'peak' else 'Area [%]')
+        show_envelope = self.combo_dah_band.currentIndex() == 1
+        if show_envelope and valid_std_pixels is not None:
+            # Include the envelope's support too; do not truncate uncertain
+            # area at the nominal maximum dose or renormalize retained pixels.
+            low_knots = beam_dose_distribution(np.maximum(valid_pixels-valid_std_pixels, 0.), max_knots=256)['dah_dose']
+            high_knots = beam_dose_distribution(valid_pixels+valid_std_pixels, max_knots=256)['dah_dose']
+            thresholds = np.unique(np.r_[thresholds, low_knots, high_knots])
+            self.curve_roi_dah.setData(thresholds, cumulative_area(valid_pixels, thresholds), pen=self.pen_dah)
+            envelope = dose_distribution_bounds(valid_pixels, valid_std_pixels, thresholds)
+            self.lbl_d90_val.setText(
+                f"<b>D90%:</b> {d90_val:.2f} Gy "
+                f"[{envelope['d90_low']:.2f}, {envelope['d90_high']:.2f}] envelope | "
+                f"<b>V95%:</b> {v95_val:.1f}%")
+            self.curve_dah_low.setData(thresholds, envelope['dah_low'])
+            self.curve_dah_high.setData(thresholds, envelope['dah_high'])
+            band_note = 'Shading is a conservative pixel-wise dose ± sigma envelope, not a confidence interval.'
         else:
             self.curve_dah_low.setData([], [])
             self.curve_dah_high.setData([], [])
+            band_note = 'No DAH confidence interval is estimated. Marginal pixel STD alone does not define spatial covariance.'
+        scale_note = ('Blue: peak-normalized histogram (maximum = 100%). ' if normalization == 'peak'
+                      else 'Blue: area in each bin (bin percentages sum to 100%). ')
+        self.plot_roi_hist.setToolTip(scale_note + 'Red: ROI area at or above dose, including true zeros. ' + band_note)
+        self.plot_roi_hist.setTitle(self._beam_distribution_title())
+        if self.combo_hist_range.currentIndex() == 0:
+            lower, upper = float(valid_pixels.min()), float(valid_pixels.max())
+        else:
+            lower, upper = 0., float(thresholds[-1])
+        if upper <= lower:
+            delta = max(abs(lower)*.02, .01)
+            lower, upper = max(0., lower-delta), upper+delta
+        self.plot_roi_hist.setXRange(lower, upper, padding=.04)
 
     def _calc_penumbra(self, prof_x, prof_y, spacing):
         """Kiszámolja a 80%-20% orvosfizikai penumbrát az átlagolt profilokból."""
@@ -1774,321 +2101,8 @@ class PrismDosimetryGUI(QMainWindow):
         except Exception:
             return None
 
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QCheckBox, QSplitter
-from PyQt5.QtCore import Qt
-import pyqtgraph as pg
-import numpy as np
-
-# A backend importja (a fenti kódból)
-# from dosimetry import BeamMorphology
-
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
-    QCheckBox, QComboBox, QSlider, QFrame, QMessageBox
-)
-from PyQt5.QtCore import Qt
-import pyqtgraph as pg
-import pyqtgraph.exporters
-import numpy as np
-import os
-import json
-import traceback
-
-class MorphologyTab(QWidget):
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        self.current_metrics = {}
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
-        
-        # --- VEZÉRLŐ ÉS STATISZTIKAI PANEL ---
-        panel_frame = QFrame()
-        panel_frame.setStyleSheet("""
-            QFrame#ControlPanel {
-                background-color: #2e3440;
-                border: 1px solid #4c566a;
-                border-radius: 6px;
-            }
-        """)
-        panel_frame.setObjectName("ControlPanel")
-        
-        panel_layout = QVBoxLayout(panel_frame)
-        panel_layout.setContentsMargins(10, 8, 10, 8)
-        panel_layout.setSpacing(8)
-
-        # 1. sor: Gombok, beállítások
-        row1 = QHBoxLayout()
-        self.btn_analyze = QPushButton("🔬 Run Analysis")
-        self.btn_analyze.setStyleSheet("background-color: #5e81ac; color: #eceff4; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
-        self.btn_analyze.clicked.connect(self.run_analysis)
-        row1.addWidget(self.btn_analyze)
-
-        lbl_mode = QLabel("<b>Mode:</b>")
-        lbl_mode.setStyleSheet("color: #eceff4;")
-        row1.addWidget(lbl_mode)
-
-        self.combo_shot_mode = QComboBox()
-        self.combo_shot_mode.addItems(["Multi-shot (500 Hz Accumulation)", "Single-shot (Instantaneous)"])
-        self.combo_shot_mode.setStyleSheet("color: #eceff4; background-color: #3b4252; padding: 3px;")
-        row1.addWidget(self.combo_shot_mode)
-        
-        self.chk_snr_mask = QCheckBox("Apply SNR > 3 Mask")
-        self.chk_snr_mask.setStyleSheet("color: #eceff4;")
-        row1.addWidget(self.chk_snr_mask)
-        
-        self.lbl_sigma = QLabel("<b>Scatter σ:</b> 0.0 mm")
-        self.lbl_sigma.setStyleSheet("color: #eceff4;")
-        row1.addWidget(self.lbl_sigma)
-        
-        self.slider_sigma = QSlider(Qt.Horizontal)
-        self.slider_sigma.setRange(0, 30)
-        self.slider_sigma.setValue(0)
-        self.slider_sigma.setFixedWidth(110)
-        self.slider_sigma.valueChanged.connect(self.on_sigma_changed)
-        row1.addWidget(self.slider_sigma)
-        
-        self.btn_export = QPushButton("💾 Save Data & Figures")
-        self.btn_export.setStyleSheet("background-color: #88c0d0; color: #2e3440; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
-        self.btn_export.clicked.connect(self.export_figures)
-        row1.addWidget(self.btn_export)
-        
-        row1.addStretch()
-        panel_layout.addLayout(row1)
-
-        # 2. sor: Statisztikák (kifejezetten látható, explicit színekkel)
-        row2 = QHBoxLayout()
-        self.lbl_moments = QLabel("<b>Skewness:</b> - | <b>Kurtosis:</b> - | <b>Entropy:</b> -")
-        self.lbl_moments.setStyleSheet("color: #eceff4; font-size: 12px;")
-        row2.addWidget(self.lbl_moments)
-
-        sep1 = QLabel("|")
-        sep1.setStyleSheet("color: #4c566a; font-weight: bold;")
-        row2.addWidget(sep1)
-
-        self.lbl_radiobio = QLabel("<b>PVDR:</b> - | <b>FHV:</b> - % | <b>LDG:</b> - Gy/mm | <b>Lacunarity:</b> -")
-        self.lbl_radiobio.setStyleSheet("color: #b48ead; font-size: 12px; font-weight: bold;")
-        row2.addWidget(self.lbl_radiobio)
-
-        sep2 = QLabel("|")
-        sep2.setStyleSheet("color: #4c566a; font-weight: bold;")
-        row2.addWidget(sep2)
-
-        self.lbl_watershed = QLabel("<b>Islands:</b> - | <b>Mean Area:</b> - mm² | <b>Dose in Islands:</b> - %")
-        self.lbl_watershed.setStyleSheet("color: #a3be8c; font-size: 12px; font-weight: bold;")
-        row2.addWidget(self.lbl_watershed)
-        
-        row2.addStretch()
-        panel_layout.addLayout(row2)
-
-        layout.addWidget(panel_frame)
-
-        # --- VIZUALIZÁCIÓS RÁCS (2 sor × 4 oszlop) ---
-        self.glw = pg.GraphicsLayoutWidget()
-        layout.addWidget(self.glw, stretch=1)
-
-        # 1. sor: PSD, 2D Autocorr, Radial Autocorr, Radon Sinogram
-        self.plot_psd = self.glw.addPlot(title="2D Power Spectrum (PSD)", row=0, col=0)
-        self.img_psd = pg.ImageItem()
-        self.plot_psd.addItem(self.img_psd)
-        self.plot_psd.setAspectLocked(True)
-        
-        self.plot_autocorr = self.glw.addPlot(title="2D Autocorrelation", row=0, col=1)
-        self.img_autocorr = pg.ImageItem()
-        self.plot_autocorr.addItem(self.img_autocorr)
-        self.plot_autocorr.setAspectLocked(True)
-
-        self.plot_rad_ac = self.glw.addPlot(title="Radial Autocorr (Size Scale)", row=0, col=2)
-        self.plot_rad_ac.setLabel('bottom', 'Radius [mm]')
-        self.plot_rad_ac.setLabel('left', 'Correlation')
-        self.curve_rad_ac = self.plot_rad_ac.plot(pen=pg.mkPen('#88c0d0', width=2))
-
-        self.plot_radon = self.glw.addPlot(title="Radon Sinogram (Banding)", row=0, col=3)
-        self.img_radon = pg.ImageItem()
-        self.plot_radon.addItem(self.img_radon)
-        self.plot_radon.setLabel('bottom', 'Angle [deg]')
-        
-        # 2. sor: Zernike Reconstruction, Zernike Coefficients (Bar), Watershed Islands
-        self.plot_zernike_map = self.glw.addPlot(title="Zernike Reconstruction", row=1, col=0)
-        self.img_zernike = pg.ImageItem()
-        self.plot_zernike_map.addItem(self.img_zernike)
-        self.plot_zernike_map.setAspectLocked(True)
-
-        self.plot_zernike_bar = self.glw.addPlot(title="Zernike Aberration Modes", row=1, col=1)
-        self.bar_zernike = pg.BarGraphItem(x=[], height=[], width=0.6, brush='#ebcb8b')
-        self.plot_zernike_bar.addItem(self.bar_zernike)
-        self.plot_zernike_bar.setLabel('bottom', 'Mode')
-
-        self.plot_watershed = self.glw.addPlot(title="Watershed Islands (Filaments)", row=1, col=2, colspan=2)
-        self.img_watershed = pg.ImageItem()
-        self.plot_watershed.addItem(self.img_watershed)
-        self.plot_watershed.setAspectLocked(True)
-
-        # Színskálák
-        lut_psd = pg.colormap.get('inferno').getLookupTable()
-        pos = np.array([0.0, 0.5, 1.0])
-        colors = np.array([[0, 50, 255, 255], [255, 255, 255, 255], [255, 50, 0, 255]], dtype=np.ubyte)
-        lut_bipolar = pg.ColorMap(pos, colors).getLookupTable()
-        lut_turbo = pg.colormap.get('turbo').getLookupTable()
-
-        self.img_psd.setLookupTable(lut_psd)
-        self.img_autocorr.setLookupTable(lut_bipolar)
-        self.img_radon.setLookupTable(lut_psd)
-        self.img_zernike.setLookupTable(lut_psd)
-        self.img_watershed.setLookupTable(lut_turbo)
-
-    def on_sigma_changed(self, value):
-        self.lbl_sigma.setText(f"<b>Scatter σ:</b> {value / 10.0:.1f} mm")
-        self.run_analysis()
-
-    def run_analysis(self):
-        if not hasattr(self.main_window, 'current_dose_map') or self.main_window.current_dose_map is None:
-            return
-            
-        dose_map = self.main_window.current_dose_map
-        std_map = getattr(self.main_window, 'current_std_map', None)
-        spacing = float(self.main_window.current_meta.get("pixel_spacing_mm", 0.0846))
-        
-        if not hasattr(self.main_window, 'roi'):
-            return
-            
-        roi_data = self.main_window.roi.getArrayRegion(dose_map, self.main_window.img_item_dose)
-        if roi_data is None or roi_data.size < 9: 
-            return
-        
-        # SNR maszkolás
-        if self.chk_snr_mask.isChecked() and std_map is not None:
-            roi_std = self.main_window.roi.getArrayRegion(std_map, self.main_window.img_item_dose)
-            snr = roi_data / np.maximum(roi_std, 1e-6)
-            roi_data = np.where(snr > 3.0, roi_data, 0.0)
-
-        # Leskálázás a gyors és akadásmentes számításhoz
-        max_size = 300
-        h, w = roi_data.shape
-        if max(h, w) > max_size:
-            from scipy.ndimage import zoom
-            scale = max_size / max(h, w)
-            roi_data = zoom(roi_data, scale, order=1)
-            spacing = spacing / scale
-
-        # Dekonvolúció (PMMA / szóródás kompenzálás)
-        sigma_mm = self.slider_sigma.value() / 10.0
-        if sigma_mm > 0:
-            roi_data = BeamMorphology.deconvolve_scattering(roi_data, sigma_mm, spacing, iterations=15)
-
-        try:
-            # 1. FFT és Autokorreláció
-            psd, autocorr, r_bins, rad_ac = BeamMorphology.compute_fft_and_autocorr(roi_data, spacing)
-            self.img_psd.setImage(psd, autoLevels=True)
-            self.img_autocorr.setImage(autocorr, autoLevels=False)
-            self.img_autocorr.setLevels([-1, 1])
-            self.curve_rad_ac.setData(r_bins, rad_ac)
-            
-            idx_half = np.where(rad_ac < 0.5)[0]
-            cl_val = r_bins[idx_half[0]] if len(idx_half) > 0 else None
-            cl_str = f"{cl_val:.2f} mm" if cl_val is not None else "N/A"
-            self.plot_rad_ac.setTitle(f"Radial Autocorr (Length: {cl_str})")
-
-            # 2. Radon transzformáció
-            sinogram, theta = BeamMorphology.compute_radon_sinogram(roi_data)
-            self.img_radon.setImage(sinogram, autoLevels=True)
-            
-            # 3. Zernike analízis
-            coeffs, labels, z_rec = BeamMorphology.compute_zernike_modes(roi_data)
-            self.img_zernike.setImage(z_rec, autoLevels=True)
-            self.bar_zernike.setOpts(x=np.arange(len(coeffs)), height=coeffs)
-            ticks = [list(zip(range(len(labels)), labels))]
-            self.plot_zernike_bar.getAxis('bottom').setTicks(ticks)
-
-            # 4. Momentumok, Radiobiológiai metrikák és Watershed
-            skewness, kurt = BeamMorphology.compute_moments(roi_data)
-            biometrics = BeamMorphology.compute_radiobiology_metrics(roi_data, spacing)
-            seg_metrics = BeamMorphology.compute_advanced_segmentation_and_entropy(roi_data, spacing)
-            
-            self.img_watershed.setImage(seg_metrics['segmented_map'], autoLevels=True)
-
-            # Szöveges adatok kiírása az UI-ra
-            self.lbl_moments.setText(
-                f"<b>Skewness:</b> {skewness:.2f} | <b>Kurtosis:</b> {kurt:.2f} | <b>Entropy:</b> {seg_metrics['shannon_entropy']:.2f}"
-            )
-            self.lbl_radiobio.setText(
-                f"<b>PVDR:</b> {biometrics['pvdr']:.2f} | "
-                f"<b>FHV (>1.5x):</b> {biometrics['fhv_pct']:.1f}% | "
-                f"<b>Mean LDG:</b> {biometrics['mean_ldg']:.1f} Gy/mm | "
-                f"<b>Lacunarity:</b> {biometrics['lacunarity']:.3f}"
-            )
-            self.lbl_watershed.setText(
-                f"<b>Islands:</b> {seg_metrics['num_islands']} | "
-                f"<b>Mean Area:</b> {seg_metrics['mean_island_area_mm2']:.2f} mm² | "
-                f"<b>Dose in Islands:</b> {seg_metrics['island_dose_fraction_pct']:.1f}%"
-            )
-
-            # Eltárolás későbbi JSON exportáláshoz
-            shot_mode = self.combo_shot_mode.currentText()
-            self.current_metrics = {
-                "shot_mode": shot_mode,
-                "skewness": float(skewness),
-                "kurtosis": float(kurt),
-                "shannon_entropy": seg_metrics['shannon_entropy'],
-                "pvdr": biometrics['pvdr'],
-                "fhv_pct": biometrics['fhv_pct'],
-                "mean_ldg_gy_mm": biometrics['mean_ldg'],
-                "lacunarity": biometrics['lacunarity'],
-                "num_islands": seg_metrics['num_islands'],
-                "mean_island_area_mm2": seg_metrics['mean_island_area_mm2'],
-                "island_dose_fraction_pct": seg_metrics['island_dose_fraction_pct'],
-                "scatter_sigma_mm": float(sigma_mm),
-                "correlation_length_mm": float(cl_val) if cl_val is not None else None,
-                "zernike_coeffs": {lbl: float(c) for lbl, c in zip(labels, coeffs)}
-            }
-        except Exception as e:
-            print(f"[MorphologyTab Exception]: {e}")
-            traceback.print_exc()
-
-    def export_figures(self):
-        if not hasattr(self.main_window, 'analysis_dir') or not self.main_window.analysis_dir:
-            QMessageBox.warning(self, "Export Error", "No active project! Please open a project first.")
-            return
-            
-        out_dir = str(self.main_window.analysis_dir)
-        base_name = getattr(self.main_window, 'current_film_name', 'morphology_scan')
-        
-        plots_to_export = {
-            "psd": self.plot_psd,
-            "autocorr": self.plot_autocorr,
-            "radial_ac": self.plot_rad_ac,
-            "sinogram": self.plot_radon,
-            "zernike_map": self.plot_zernike_map,
-            "zernike_bar": self.plot_zernike_bar,
-            "watershed_islands": self.plot_watershed,
-            "composite_grid": self.glw.scene()
-        }
-        
-        try:
-            # 1. JSON mentés
-            if hasattr(self, 'current_metrics') and self.current_metrics:
-                json_path = os.path.join(out_dir, f"{base_name}_morphology_metrics.json")
-                with open(json_path, 'w') as f:
-                    json.dump(self.current_metrics, f, indent=4)
-                    
-            # 2. Nagy felbontású képek mentése
-            for suffix, item in plots_to_export.items():
-                exporter = pg.exporters.ImageExporter(item)
-                exporter.parameters()['width'] = 2000
-                filename = os.path.join(out_dir, f"{base_name}_{suffix}.png")
-                exporter.export(filename)
-                
-            QMessageBox.information(self, "Export Successful", f"Data and all 7 figures saved to:\n{out_dir}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to save data:\n{str(e)}")
+from morphology_tab import MorphologyTab
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    window = PrismDosimetryGUI()
-    window.show()
-    sys.exit(app.exec_())
+    from prism_app import main
+    sys.exit(main())
