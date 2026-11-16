@@ -1,5 +1,25 @@
 # PRISM
 
+Radiochromic film dosimetry and measured beam-footprint analysis with a PyQt5 desktop interface.
+
+- **Documentation:** [polanek.hu/en/software/prism/](https://polanek.hu/en/software/prism/)
+- **Source code:** [github.com/polanekr/prism](https://github.com/polanekr/prism)
+- **Current application:** desktop version **0.1.0**, Python 3.12–3.14, Windows x64 / Linux x86-64.
+- **Scope:** calibrated 2D film dose maps, beam descriptors and the documented FRONT–BACK intermediate-plane sample-dose estimate. Full 3D reconstruction, proton-spectrum unfolding and biological response modelling are not implemented in this desktop version.
+- **Earlier framework:** preserved on [`legacy/framework-2026-11-16`](https://github.com/polanekr/prism/tree/legacy/framework-2026-11-16); see [MIGRATION.md](MIGRATION.md). Its README and examples describe a different architecture.
+
+## Obtain the current desktop application
+
+```bash
+git clone https://github.com/polanekr/prism.git
+cd prism
+uv sync --locked --all-extras
+uv run --no-sync prism --check --require-bayes --require-excel
+uv run --no-sync prism
+```
+
+For the reviewed release, use `git checkout v0.1.0` after cloning. Source installation is documented below and in the [English installation guide](https://polanek.hu/en/software/prism/installation/). No standalone Windows installer is supplied by this source release.
+
 Gafchromic-film dozimetriai és nyalábanalízis alkalmazás PyQt5 felülettel.
 
 ## Telepítés Windowsra és Linuxra
